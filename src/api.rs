@@ -15,6 +15,27 @@ pub struct LoginPayload<'a> {
     pub password: &'a str,
 }
 
+#[derive(Serialize)]
+pub struct CreateRoomPayload<'a> {
+    pub token: &'a str,
+    pub name: &'a str,
+}
+
+#[derive(Serialize)]
+pub struct JoinRoomPayload<'a> {
+    pub token: &'a str,
+    #[serde(rename = "roomId")]
+    pub room_id: &'a str,
+}
+
+#[derive(Serialize)]
+pub struct MessagePayload<'a> {
+    pub token: &'a str,
+    #[serde(rename = "roomId")]
+    pub room_id: &'a str,
+    pub content: &'a str,
+}
+
 // A generic wrapper for all client-sent messages
 #[derive(Serialize)]
 pub struct ClientMessage<'a, T> {
@@ -36,8 +57,30 @@ pub struct LoggedInPayload {
 }
 
 #[derive(Deserialize, Debug)]
+pub struct RoomCreatedPayload {
+    #[serde(rename = "roomId")]
+    pub room_id: String,
+    pub name: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct JoinedRoomPayload {
+    #[serde(rename = "roomId")]
+    pub room_id: String,
+    pub name: String,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct Author {
     pub username: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct MessageWithAuthor {
+    pub content: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: DateTime<Utc>,
+    pub author: Author,
 }
 
 #[derive(Deserialize, Debug)]
@@ -62,7 +105,19 @@ pub struct HistoryPayload {
 pub enum ServerMessage {
     Registered(SimpleMessagePayload),
     LoggedIn(LoggedInPayload),
+    JoinedRoom(JoinedRoomPayload),
+    History(HistoryPayload),
+    Message(MessageWithAuthor),
+    UserJoined(SimpleMessagePayload),
+    UserLeft(SimpleMessagePayload),
+    JoinRequest(SimpleMessagePayload),
+    JoinApproved(JoinedRoomPayload),
+    JoinRejected(SimpleMessagePayload),
+    JoinRequestSent(SimpleMessagePayload),
+    Info(SimpleMessagePayload),
+    RoomDeleted(SimpleMessagePayload),
     Error(SimpleMessagePayload),
+    RoomCreated(RoomCreatedPayload),
     // Add other server message types here as you implement them
     // e.g., RoomCreated, JoinedRoom, Message, etc.
 }
