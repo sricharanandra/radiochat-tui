@@ -36,6 +36,11 @@ pub struct MessagePayload<'a> {
     pub content: &'a str,
 }
 
+#[derive(Serialize)]
+pub struct GetUserRoomsPayload<'a> {
+    pub token: &'a str,
+}
+
 // A generic wrapper for all client-sent messages
 #[derive(Serialize)]
 pub struct ClientMessage<'a, T> {
@@ -68,6 +73,19 @@ pub struct JoinedRoomPayload {
     #[serde(rename = "roomId")]
     pub room_id: String,
     pub name: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct RoomInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct UserRoomsPayload {
+    pub rooms: Vec<RoomInfo>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -118,6 +136,7 @@ pub enum ServerMessage {
     RoomDeleted(SimpleMessagePayload),
     Error(SimpleMessagePayload),
     RoomCreated(RoomCreatedPayload),
+    UserRooms(UserRoomsPayload),
     // Add other server message types here as you implement them
     // e.g., RoomCreated, JoinedRoom, Message, etc.
 }

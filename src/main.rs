@@ -2,7 +2,7 @@ mod api;
 
 use api::{
     ClientMessage, CreateRoomPayload, JoinRoomPayload, LoginPayload, MessagePayload,
-    MessageWithAuthor, RegisterPayload, ServerMessage,
+    MessageWithAuthor, RegisterPayload, RoomInfo, ServerMessage,
 };
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
@@ -32,6 +32,7 @@ enum CurrentScreen {
     Main,
     RoomCreation,
     RoomJoining,
+    RoomSelector,
 }
 
 #[derive(Clone)]
@@ -68,6 +69,10 @@ struct App<'a> {
     username: Option<String>,
     status_message: String,
     should_quit: bool,
+
+    // room management
+    joined_rooms: Vec<RoomInfo>, // List of rooms user is member of
+    room_selector_index: usize,
 
     // Room Data
     current_room: Option<RoomInfo>,
@@ -120,6 +125,8 @@ impl<'a> Default for App<'a> {
             currently_editing: CurrentlyEditing::Username,
             jwt: None,
             should_quit: false,
+            joined_rooms: Vec::new(),
+            room_selector_index: 0,
             username: None,
             status_message: String::from("Choose Login or Signup"),
             current_room: None,
@@ -160,6 +167,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                     CurrentScreen::Main => handle_main_screen(app, key).await?,
                     CurrentScreen::RoomJoining => handle_room_joining(app, key).await?,
                     CurrentScreen::RoomCreation => handle_room_creation(app, key).await?,
+                    CurrentScreen::RoomSelector => handle_room_selector(app, key).await?,
                 }
             }
         }
