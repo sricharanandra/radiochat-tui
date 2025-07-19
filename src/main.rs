@@ -7,7 +7,10 @@ use api::{
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
     crossterm::{
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+        event::{
+            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+            KeyModifiers,
+        },
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
@@ -64,6 +67,7 @@ struct App<'a> {
     jwt: Option<String>,
     username: Option<String>,
     status_message: String,
+    should_quit: bool,
 
     // Room Data
     current_room: Option<RoomInfo>,
@@ -115,6 +119,7 @@ impl<'a> Default for App<'a> {
             current_screen: CurrentScreen::AuthChoice,
             currently_editing: CurrentlyEditing::Username,
             jwt: None,
+            should_quit: false,
             username: None,
             status_message: String::from("Choose Login or Signup"),
             current_room: None,
@@ -142,6 +147,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
     loop {
         terminal.draw(|f| ui(f, app))?;
 
+        if app.should_quit {
+            break;
+        }
+
         if let Event::Key(key) = event::read()? {
             if key.kind == KeyEventKind::Press {
                 match app.current_screen {
@@ -155,6 +164,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
             }
         }
     }
+    Ok(())
 }
 
 async fn handle_auth_choice(
@@ -173,9 +183,7 @@ async fn handle_auth_choice(
             app.status_message = "Create a new account".to_string();
         }
         KeyCode::Esc => {
-            // ---- FIX ISSUE HERE -----
-            // TUI not clearing off screen after exiting app
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "User quit"));
+            app.should_quit = true;
         }
         _ => {}
     }
@@ -318,13 +326,21 @@ async fn handle_main_screen(
     key: ratatui::crossterm::event::KeyEvent,
 ) -> io::Result<()> {
     match key.code {
-        KeyCode::Char('n') | KeyCode::Char('N') => {
+        KeyCode::Char('n')
+            if key
+                .modifiers
+                .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
+        {
             app.current_screen = CurrentScreen::RoomCreation;
             app.currently_editing = CurrentlyEditing::RoomName;
             app.status_message = "Enter room name...".to_string();
         }
 
-        KeyCode::Char('j') | KeyCode::Char('J') => {
+        KeyCode::Char('j')
+            if key
+                .modifiers
+                .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
+        {
             app.current_screen = CurrentScreen::RoomJoining;
             app.currently_editing = CurrentlyEditing::RoomId;
             app.status_message = "Enter Room Id".to_string();
@@ -353,7 +369,7 @@ async fn handle_main_screen(
                 app.messages.clear();
                 app.status_message = "Left room".to_string();
             } else {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "User quit"));
+                app.should_quit = true;
             }
         }
 
@@ -662,9 +678,9 @@ fn ui(f: &mut Frame, app: &mut App) {
 
 fn render_auth_choice(f: &mut Frame, area: Rect) {
     let auth_text = Text::from(vec![
-        Line::from("🎵 Welcome to RadioChat! 🎵"),
+        Line::from("Welcome to RadioChat! "),
         Line::from(""),
-        Line::from("Ready to tune in?"),
+        Line::from("Tune your radio frequencies to enter this new world of comms"),
         Line::from(""),
         Line::from("Press:"),
         Line::from("  L - Login to existing account"),
@@ -753,12 +769,12 @@ fn render_main(f: &mut Frame, app: &mut App, area: Rect) {
         None => {
             // Placeholder
             let placeholder_text = Text::from(vec![
-                Line::from("🎵 Welcome to RadioChat! 🎵"),
+                Line::from("Radiocheck finish. Welcome to the next gen comms app!"),
                 Line::from(""),
-                Line::from("Ready to tune in?"),
+                Line::from("Tune into your frequency"),
                 Line::from(""),
-                Line::from("📻 Press N to create a new room"),
-                Line::from("🔗 Press J to join a room by ID"),
+                Line::from("📻 Press SUPER + n to create a new room"),
+                Line::from("🔗 Press SUPER + j to join a room by ID"),
                 Line::from(""),
                 Line::from("\"Broadcasting good vibes...\""),
             ]);
@@ -817,7 +833,7 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
             if app.current_room.is_some() {
                 "Enter: Send message | Esc: Leave room"
             } else {
-                "N: New room | J: Join room | Esc: Quit"
+                "SUPER + n: New room | Super + j: Join room | Esc: Quit"
             }
         }
         CurrentScreen::RoomCreation => "Enter: Create room | Esc: Cancel",
