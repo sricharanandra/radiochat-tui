@@ -1,16 +1,12 @@
 mod api;
+mod crypto;
 
-use api::{
-    ClientMessage, CreateRoomPayload, JoinRoomPayload, LoginPayload, MessagePayload,
-    MessageWithAuthor, RegisterPayload, RoomInfo, ServerMessage,
-};
+use crate::crypto::{decrypt, encrypt, generate_key, AesKey};
+use api::{ClientMessage, JoinRoomPayload, SendMessagePayload, ServerMessage};
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
     crossterm::{
-        event::{
-            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-            KeyModifiers,
-        },
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
@@ -24,59 +20,34 @@ use tui_textarea::TextArea;
 
 // --- Application State ---
 
-#[derive(Clone)]
 enum CurrentScreen {
-    AuthChoice,
-    Login,
-    Signup,
-    Main,
+    RoomChoice,
     RoomCreation,
     RoomJoining,
-    RoomSelector,
+    InRoom,
 }
 
-#[derive(Clone)]
 enum CurrentlyEditing {
-    Username,
-    Password,
-    ConfirmPassword,
-    RoomName,
     RoomId,
-    Message,
-}
-
-#[derive(Clone)]
-struct RoomInfo {
-    id: String,
-    name: String,
+    RoomKey,
 }
 
 struct App<'a> {
-    // Auth inputs
-    username_input: TextArea<'a>,
-    password_input: TextArea<'a>,
-    confirm_password_input: TextArea<'a>,
-
-    // Room inputs
+    // Inputs
     room_id_input: TextArea<'a>,
-    room_name_input: TextArea<'a>,
+    room_key_input: TextArea<'a>,
     message_input: TextArea<'a>,
 
-    // States
+    // State
     current_screen: CurrentScreen,
-    currently_editing: CurrentlyEditing,
-    jwt: Option<String>,
-    username: Option<String>,
+    currently_editing: Option<CurrentlyEditing>,
     status_message: String,
     should_quit: bool,
 
-    // room management
-    joined_rooms: Vec<RoomInfo>, // List of rooms user is member of
-    room_selector_index: usize,
-
     // Room Data
-    current_room: Option<RoomInfo>,
-    messages: Vec<MessageWithAuthor>,
+    room_id: Option<String>,
+    room_key: Option<AesKey>,
+    messages: Vec<String>,
 
     // WebSocket
     ws_sender: Option<mpsc::UnboundedSender<String>>,
@@ -84,52 +55,28 @@ struct App<'a> {
 
 impl<'a> Default for App<'a> {
     fn default() -> Self {
-        let mut username_input = TextArea::default();
-        username_input.set_placeholder_text("Enter username...");
-        username_input.set_block(Block::default().borders(Borders::ALL).title("Username"));
-
-        let mut password_input = TextArea::default();
-        password_input.set_placeholder_text("Enter password...");
-        password_input.set_block(Block::default().borders(Borders::ALL).title("Password"));
-        password_input.set_style(Style::default().add_modifier(Modifier::HIDDEN));
-
-        let mut confirm_password_input = TextArea::default();
-        confirm_password_input.set_placeholder_text("Confirm password...");
-        confirm_password_input.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Confirm Password"),
-        );
-        confirm_password_input.set_style(Style::default().add_modifier(Modifier::HIDDEN));
-
-        let mut room_name_input = TextArea::default();
-        room_name_input.set_placeholder_text("Enter a valid room name...");
-        room_name_input.set_block(Block::default().borders(Borders::ALL).title("Room Name"));
-
         let mut room_id_input = TextArea::default();
-        room_id_input.set_placeholder_text("Enter Room Id...");
+        room_id_input.set_placeholder_text("Enter the Room ID...");
         room_id_input.set_block(Block::default().borders(Borders::ALL).title("Room ID"));
 
+        let mut room_key_input = TextArea::default();
+        room_key_input.set_placeholder_text("Enter the secret Room Key...");
+        room_key_input.set_block(Block::default().borders(Borders::ALL).title("Room Key"));
+
         let mut message_input = TextArea::default();
-        message_input.set_placeholder_text("Type your message...");
+        message_input.set_placeholder_text("Type your encrypted message...");
         message_input.set_block(Block::default().borders(Borders::ALL).title("Message"));
 
         App {
-            username_input,
-            password_input,
-            confirm_password_input,
-            room_name_input,
             room_id_input,
+            room_key_input,
             message_input,
-            current_screen: CurrentScreen::AuthChoice,
-            currently_editing: CurrentlyEditing::Username,
-            jwt: None,
+            current_screen: CurrentScreen::RoomChoice,
+            currently_editing: None,
+            status_message: "Create or Join a secure room.".to_string(),
             should_quit: false,
-            joined_rooms: Vec::new(),
-            room_selector_index: 0,
-            username: None,
-            status_message: String::from("Choose Login or Signup"),
-            current_room: None,
+            room_id: None,
+            room_key: None,
             messages: Vec::new(),
             ws_sender: None,
         }
@@ -140,17 +87,16 @@ impl<'a> Default for App<'a> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Setup terminal
     let mut terminal = init_terminal()?;
     let mut app = App::default();
     run_app(&mut terminal, &mut app).await?;
-
-    // Restore terminal
     restore_terminal(&mut terminal)?;
     Ok(())
 }
 
 async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> io::Result<()> {
+    let (ws_incoming_tx, mut ws_incoming_rx) = mpsc::unbounded_channel::<String>();
+
     loop {
         terminal.draw(|f| ui(f, app))?;
 
@@ -158,16 +104,31 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
             break;
         }
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                match app.current_screen {
-                    CurrentScreen::AuthChoice => handle_auth_choice(app, key).await?,
-                    CurrentScreen::Login => handle_login_screen(app, key).await?,
-                    CurrentScreen::Signup => handle_signup_screen(app, key).await?,
-                    CurrentScreen::Main => handle_main_screen(app, key).await?,
-                    CurrentScreen::RoomJoining => handle_room_joining(app, key).await?,
-                    CurrentScreen::RoomCreation => handle_room_creation(app, key).await?,
-                    CurrentScreen::RoomSelector => handle_room_selector(app, key).await?,
+        // Handle incoming WebSocket messages without blocking UI
+        if let Ok(text) = ws_incoming_rx.try_recv() {
+            match serde_json::from_str::<ServerMessage>(&text) {
+                Ok(server_msg) => handle_server_message(app, server_msg),
+                Err(_) => {
+                    // Raw info messages from the server
+                    app.messages.push(format!("[SERVER] {}", text));
+                }
+            };
+        }
+
+        // Handle user input
+        if event::poll(std::time::Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match app.current_screen {
+                        CurrentScreen::RoomChoice => handle_room_choice_screen(app, key).await,
+                        CurrentScreen::RoomCreation => {
+                            handle_room_creation_screen(app, key, ws_incoming_tx.clone()).await
+                        }
+                        CurrentScreen::RoomJoining => {
+                            handle_room_joining_screen(app, key, ws_incoming_tx.clone()).await
+                        }
+                        CurrentScreen::InRoom => handle_in_room_screen(app, key).await,
+                    }
                 }
             }
         }
@@ -175,482 +136,249 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
     Ok(())
 }
 
-async fn handle_auth_choice(
-    app: &mut App<'_>,
-    key: ratatui::crossterm::event::KeyEvent,
-) -> io::Result<()> {
+// --- Screen & Input Handlers ---
+
+async fn handle_room_choice_screen(app: &mut App<'_>, key: event::KeyEvent) {
     match key.code {
-        KeyCode::Char('l') | KeyCode::Char('L') => {
-            app.current_screen = CurrentScreen::Login;
-            app.currently_editing = CurrentlyEditing::Username;
-            app.status_message = "Enter your login credentials".to_string();
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            let new_room_id = hex::encode(rand::random::<[u8; 16]>());
+            let new_key = generate_key();
+
+            app.status_message =
+                format!("New Room Created! SAVE THESE DETAILS. Press Enter to continue.");
+            app.messages = vec![
+                "IMPORTANT: Share this Room ID and Key SECURELY with others.".to_string(),
+                "There is no way to recover them.".to_string(),
+                "".to_string(),
+                format!("Room ID: {}", new_room_id),
+                format!("Room Key: {}", hex::encode(new_key.as_slice())),
+            ];
+
+            app.room_id = Some(new_room_id);
+            app.room_key = Some(new_key);
+            app.current_screen = CurrentScreen::RoomCreation;
         }
-        KeyCode::Char('s') | KeyCode::Char('S') => {
-            app.current_screen = CurrentScreen::Signup;
-            app.currently_editing = CurrentlyEditing::Username;
-            app.status_message = "Create a new account".to_string();
+        KeyCode::Char('j') | KeyCode::Char('J') => {
+            app.current_screen = CurrentScreen::RoomJoining;
+            app.currently_editing = Some(CurrentlyEditing::RoomId);
+            app.status_message = "Enter Room ID and Key to join.".to_string();
         }
         KeyCode::Esc => {
             app.should_quit = true;
         }
         _ => {}
     }
-    Ok(())
 }
 
-async fn handle_login_screen(
+async fn handle_room_creation_screen(
     app: &mut App<'_>,
-    key: ratatui::crossterm::event::KeyEvent,
-) -> io::Result<()> {
+    key: event::KeyEvent,
+    ws_tx: mpsc::UnboundedSender<String>,
+) {
+    if let KeyCode::Enter = key.code {
+        app.status_message = "Connecting...".to_string();
+        if connect(app, ws_tx).await.is_ok() {
+            app.messages.clear();
+            app.current_screen = CurrentScreen::InRoom;
+            app.status_message = "Connected to room!".to_string();
+        } else {
+            app.status_message = "Failed to connect.".to_string();
+        }
+    }
+}
+
+async fn handle_room_joining_screen(
+    app: &mut App<'_>,
+    key: event::KeyEvent,
+    ws_tx: mpsc::UnboundedSender<String>,
+) {
     match key.code {
         KeyCode::Enter => {
-            let username = app.username_input.lines().join("").trim().to_string();
-            let password = app.password_input.lines().join("").trim().to_string();
+            let room_id = app.room_id_input.lines().join("");
+            let room_key_hex = app.room_key_input.lines().join("");
 
-            if !username.is_empty() && !password.is_empty() {
-                app.status_message = "Connecting...".to_string();
-                app.username = Some(username.clone());
+            if room_id.is_empty() || room_key_hex.is_empty() {
+                app.status_message = "Both Room ID and Key are required.".to_string();
+                return;
+            }
 
-                match attempt_login(&username, &password).await {
-                    Ok(token) => {
-                        app.jwt = Some(token);
-                        app.current_screen = CurrentScreen::Main;
-                        app.status_message = "Login Successful".to_string();
-                    }
-                    Err(e) => {
-                        app.status_message = format!("Login Failed: {}", e);
-                    }
+            let key_bytes = match hex::decode(room_key_hex) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    app.status_message = "Invalid Room Key format. Must be hex.".to_string();
+                    return;
                 }
+            };
+
+            let key = AesKey::from_slice(&key_bytes);
+
+            // Set state before attempting to connect
+            app.room_id = Some(room_id);
+            app.room_key = Some(*key);
+
+            app.status_message = "Connecting...".to_string();
+            if connect(app, ws_tx).await.is_ok() {
+                app.current_screen = CurrentScreen::InRoom;
+                app.status_message = "Connected to room!".to_string();
             } else {
-                app.status_message = "Please enter your credentials".to_string();
+                app.status_message =
+                    "Failed to connect. Check Room ID/Key and network.".to_string();
+                // Clear invalid state
+                app.room_id = None;
+                app.room_key = None;
             }
         }
         KeyCode::Tab => {
             app.currently_editing = match app.currently_editing {
-                CurrentlyEditing::Username => CurrentlyEditing::Password,
-                CurrentlyEditing::Password => CurrentlyEditing::Username,
-                _ => CurrentlyEditing::Username,
+                Some(CurrentlyEditing::RoomId) => Some(CurrentlyEditing::RoomKey),
+                _ => Some(CurrentlyEditing::RoomId),
             };
         }
         KeyCode::Esc => {
-            app.current_screen = CurrentScreen::AuthChoice;
-            app.status_message = "Choose Login or Signup".to_string();
-            clear_inputs(app);
+            app.current_screen = CurrentScreen::RoomChoice;
+            app.status_message = "Create or Join a secure room.".to_string();
+            app.room_id_input.move_cursor(tui_textarea::CursorMove::End);
+            app.room_key_input
+                .move_cursor(tui_textarea::CursorMove::End);
         }
         _ => {
             let input = Event::Key(key);
             match app.currently_editing {
-                CurrentlyEditing::Username => {
-                    app.username_input.input(input);
+                Some(CurrentlyEditing::RoomId) => {
+                    app.room_id_input.input(input);
                 }
-                CurrentlyEditing::Password => {
-                    app.password_input.input(input);
+                Some(CurrentlyEditing::RoomKey) => {
+                    app.room_key_input.input(input);
                 }
                 _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn handle_signup_screen(
-    app: &mut App<'_>,
-    key: ratatui::crossterm::event::KeyEvent,
-) -> io::Result<()> {
-    match key.code {
-        KeyCode::Enter => {
-            let username = app.username_input.lines().join("").trim().to_string();
-            let password = app.password_input.lines().join("").trim().to_string();
-            let confirm_password = app
-                .confirm_password_input
-                .lines()
-                .join("")
-                .trim()
-                .to_string();
-
-            if username.is_empty() || password.is_empty() || confirm_password.is_empty() {
-                app.status_message = "Please fill in all fields".to_string();
-                return Ok(());
-            }
-
-            if password != confirm_password {
-                app.status_message = "Passwords do not match".to_string();
-                return Ok(());
-            }
-
-            if password.len() < 6 {
-                app.status_message = "Password must be at least 6 characters".to_string();
-                return Ok(());
-            }
-
-            app.status_message = "Creating account...".to_string();
-
-            match attempt_signup(&username, &password).await {
-                Ok(_) => {
-                    app.status_message = "Account created! Please login.".to_string();
-                    app.current_screen = CurrentScreen::Login;
-                    clear_inputs(app);
-                    app.currently_editing = CurrentlyEditing::Username;
-                }
-                Err(e) => {
-                    app.status_message = format!("Signup Failed: {}", e);
-                }
-            }
-        }
-        KeyCode::Tab => {
-            app.currently_editing = match app.currently_editing {
-                CurrentlyEditing::Username => CurrentlyEditing::Password,
-                CurrentlyEditing::Password => CurrentlyEditing::ConfirmPassword,
-                CurrentlyEditing::ConfirmPassword => CurrentlyEditing::Username,
-                _ => CurrentlyEditing::Username,
             };
         }
-        KeyCode::Esc => {
-            app.current_screen = CurrentScreen::AuthChoice;
-            app.status_message = "Choose Login or Signup".to_string();
-            clear_inputs(app);
-        }
-        _ => {
-            let input = Event::Key(key);
-            match app.currently_editing {
-                CurrentlyEditing::Username => {
-                    app.username_input.input(input);
-                }
-                CurrentlyEditing::Password => {
-                    app.password_input.input(input);
-                }
-                CurrentlyEditing::ConfirmPassword => {
-                    app.confirm_password_input.input(input);
-                }
-                _ => {}
-            }
-        }
     }
-    Ok(())
 }
 
-async fn handle_main_screen(
-    app: &mut App<'_>,
-    key: ratatui::crossterm::event::KeyEvent,
-) -> io::Result<()> {
+async fn handle_in_room_screen(app: &mut App<'_>, key: event::KeyEvent) {
     match key.code {
-        KeyCode::Char('n')
-            if key
-                .modifiers
-                .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
-        {
-            app.current_screen = CurrentScreen::RoomCreation;
-            app.currently_editing = CurrentlyEditing::RoomName;
-            app.status_message = "Enter room name...".to_string();
-        }
-
-        KeyCode::Char('j')
-            if key
-                .modifiers
-                .contains(ratatui::crossterm::event::KeyModifiers::CONTROL) =>
-        {
-            app.current_screen = CurrentScreen::RoomJoining;
-            app.currently_editing = CurrentlyEditing::RoomId;
-            app.status_message = "Enter Room Id".to_string();
-        }
-
         KeyCode::Enter => {
-            if app.current_room.is_some() {
-                let message = app.message_input.lines().join("").trim().to_string();
-                if !message.is_empty() && app.jwt.is_some() {
-                    if let Err(e) = send_message(app, &message).await {
-                        app.status_message = format!("Failed to send message: {}", e);
-                    } else {
-                        app.message_input = TextArea::default();
-                        app.message_input
-                            .set_placeholder_text("Type your message...");
-                        app.message_input
-                            .set_block(Block::default().borders(Borders::ALL).title("Message"));
+            let content = app.message_input.lines().join("\n");
+            if !content.is_empty() {
+                if let (Some(sender), Some(key), Some(room_id)) =
+                    (&app.ws_sender, &app.room_key, &app.room_id)
+                {
+                    match encrypt(key, content.as_bytes()) {
+                        Ok(ciphertext) => {
+                            let payload = SendMessagePayload {
+                                room_id,
+                                ciphertext: &ciphertext,
+                            };
+                            let msg = ClientMessage {
+                                typ: "message",
+                                payload,
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if sender.send(json).is_ok() {
+                                    app.message_input = TextArea::default();
+                                    app.message_input
+                                        .set_placeholder_text("Type your encrypted message...");
+                                    app.message_input.set_block(
+                                        Block::default().borders(Borders::ALL).title("Message"),
+                                    );
+                                } else {
+                                    app.status_message =
+                                        "Connection lost. Restart to reconnect.".to_string();
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            app.status_message = "FATAL: Failed to encrypt message.".to_string();
+                        }
                     }
                 }
             }
         }
-
         KeyCode::Esc => {
-            if app.current_room.is_some() {
-                app.current_room = None;
-                app.messages.clear();
-                app.status_message = "Left room".to_string();
-            } else {
-                app.should_quit = true;
-            }
+            app.should_quit = true; // For simplicity, Esc now quits the app.
         }
-
         _ => {
-            if app.current_room.is_some() {
-                let input = Event::Key(key);
-                app.message_input.input(input);
-            }
+            app.message_input.input(Event::Key(key));
         }
     }
-    Ok(())
 }
 
-async fn handle_room_creation(
-    app: &mut App<'_>,
-    key: ratatui::crossterm::event::KeyEvent,
-) -> io::Result<()> {
-    match key.code {
-        KeyCode::Enter => {
-            let room_name = app.room_name_input.lines().join("").trim().to_string();
-            if !room_name.is_empty() && app.jwt.is_some() {
-                app.status_message = "Creating room...".to_string();
-                if let Err(e) = create_room(app, &room_name).await {
-                    app.status_message = format!("Failed to create room: {}", e);
-                } else {
-                    app.current_screen = CurrentScreen::Main;
-                    app.room_name_input = TextArea::default();
-                    app.room_name_input
-                        .set_placeholder_text("Enter room name...");
-                    app.room_name_input
-                        .set_block(Block::default().borders(Borders::ALL).title("Room Name"));
+// --- WebSocket & Message Handling ---
+
+fn handle_server_message(app: &mut App, msg: ServerMessage) {
+    match msg {
+        ServerMessage::Message(payload) => {
+            if let Some(key) = &app.room_key {
+                match decrypt(key, &payload.ciphertext) {
+                    Ok(plaintext) => app.messages.push(plaintext),
+                    Err(_) => app
+                        .messages
+                        .push("[DECRYPTION_ERROR] Received invalid message".to_string()),
                 }
             }
         }
-        KeyCode::Esc => {
-            app.current_screen = CurrentScreen::Main;
-            app.status_message = "Cancelled room creation".to_string();
-            app.room_name_input = TextArea::default();
-            app.room_name_input
-                .set_placeholder_text("Enter room name...");
-            app.room_name_input
-                .set_block(Block::default().borders(Borders::ALL).title("Room Name"));
+        ServerMessage::Info(payload) => {
+            app.messages.push(format!("[SERVER] {}", payload.message));
         }
-        _ => {
-            let input = Event::Key(key);
-            app.room_name_input.input(input);
+        ServerMessage::Error(payload) => {
+            app.status_message = format!("[ERROR] {}", payload.message);
         }
     }
-    Ok(())
 }
 
-async fn handle_room_joining(
+async fn connect(
     app: &mut App<'_>,
-    key: ratatui::crossterm::event::KeyEvent,
-) -> io::Result<()> {
-    match key.code {
-        KeyCode::Enter => {
-            let room_id = app.room_id_input.lines().join("").trim().to_string();
-            if !room_id.is_empty() && app.jwt.is_some() {
-                app.status_message = "Joining room...".to_string();
-                if let Err(e) = join_room(app, &room_id).await {
-                    app.status_message = format!("Failed to join room: {}", e);
-                } else {
-                    app.current_screen = CurrentScreen::Main;
-                    app.room_id_input = TextArea::default();
-                    app.room_id_input.set_placeholder_text("Enter room ID...");
-                    app.room_id_input
-                        .set_block(Block::default().borders(Borders::ALL).title("Room ID"));
-                }
-            }
-        }
-        KeyCode::Esc => {
-            app.current_screen = CurrentScreen::Main;
-            app.status_message = "Cancelled room joining".to_string();
-            app.room_id_input = TextArea::default();
-            app.room_id_input.set_placeholder_text("Enter room ID...");
-            app.room_id_input
-                .set_block(Block::default().borders(Borders::ALL).title("Room ID"));
-        }
-        _ => {
-            let input = Event::Key(key);
-            app.room_id_input.input(input);
-        }
-    }
-    Ok(())
-}
+    ws_incoming_tx: mpsc::UnboundedSender<String>,
+) -> Result<(), Box<dyn Error>> {
+    let room_id = app.room_id.as_ref().ok_or("Room ID not set")?;
 
-// --- Helper Functions ---
-
-fn clear_inputs(app: &mut App<'_>) {
-    app.username_input = TextArea::default();
-    app.username_input.set_placeholder_text("Enter username...");
-    app.username_input
-        .set_block(Block::default().borders(Borders::ALL).title("Username"));
-
-    app.password_input = TextArea::default();
-    app.password_input.set_placeholder_text("Enter password...");
-    app.password_input
-        .set_block(Block::default().borders(Borders::ALL).title("Password"));
-    app.password_input
-        .set_style(Style::default().add_modifier(Modifier::HIDDEN));
-
-    app.confirm_password_input = TextArea::default();
-    app.confirm_password_input
-        .set_placeholder_text("Confirm password...");
-    app.confirm_password_input.set_block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Confirm Password"),
-    );
-    app.confirm_password_input
-        .set_style(Style::default().add_modifier(Modifier::HIDDEN));
-}
-
-// --- WebSocket Handling ---
-
-async fn attempt_login(username: &str, password: &str) -> Result<String, Box<dyn Error>> {
     let (ws_stream, _) = connect_async("ws://tunnel.sreus.tech:8080").await?;
     let (mut write, mut read) = ws_stream.split();
 
-    let login_payload = LoginPayload { username, password };
-    let login_message = ClientMessage {
-        typ: "login",
-        payload: login_payload,
-    };
+    // Create a channel for sending messages to the WebSocket task
+    let (ws_outgoing_tx, mut ws_outgoing_rx) = mpsc::unbounded_channel::<String>();
+    app.ws_sender = Some(ws_outgoing_tx);
 
-    let message_json = serde_json::to_string(&login_message)?;
+    // Join the room
+    let join_payload = JoinRoomPayload { room_id };
+    let join_message = ClientMessage {
+        typ: "joinRoom",
+        payload: join_payload,
+    };
+    let message_json = serde_json::to_string(&join_message)?;
     write.send(Message::text(message_json)).await?;
 
-    while let Some(message) = read.next().await {
-        let message = message?;
-        if let Message::Text(text) = message {
-            let server_response: ServerMessage = serde_json::from_str(&text)?;
-
-            match server_response {
-                ServerMessage::LoggedIn(payload) => return Ok(payload.token),
-                ServerMessage::Error(payload) => {
-                    return Err(payload.message.into());
-                }
-                _ => {}
-            }
-        }
-    }
-    Err("Connection closed unexpectedly".into())
-}
-
-async fn attempt_signup(username: &str, password: &str) -> Result<(), Box<dyn Error>> {
-    let (ws_stream, _) = connect_async("ws://tunnel.sreus.tech:8080").await?;
-    let (mut write, mut read) = ws_stream.split();
-
-    let signup_payload = RegisterPayload { username, password };
-    let signup_message = ClientMessage {
-        typ: "register",
-        payload: signup_payload,
-    };
-
-    let message_json = serde_json::to_string(&signup_message)?;
-    write.send(Message::text(message_json)).await?;
-
-    while let Some(message) = read.next().await {
-        let message = message?;
-        if let Message::Text(text) = message {
-            let server_response: ServerMessage = serde_json::from_str(&text)?;
-
-            match server_response {
-                ServerMessage::Registered(_) => return Ok(()),
-                ServerMessage::Error(payload) => {
-                    return Err(payload.message.into());
-                }
-                _ => {}
-            }
-        }
-    }
-    Err("Connection closed unexpectedly".into())
-}
-
-async fn create_room(app: &mut App<'_>, room_name: &str) -> Result<(), Box<dyn Error>> {
-    let (ws_stream, _) = connect_async("ws://tunnel.sreus.tech:8080").await?;
-    let (mut write, mut read) = ws_stream.split();
-
-    if let Some(token) = &app.jwt {
-        let create_payload = CreateRoomPayload {
-            token,
-            name: room_name,
-        };
-        let create_message = ClientMessage {
-            typ: "createRoom",
-            payload: create_payload,
-        };
-
-        let message_json = serde_json::to_string(&create_message)?;
-        write.send(Message::text(message_json)).await?;
-
-        while let Some(message) = read.next().await {
-            let message = message?;
-            if let Message::Text(text) = message {
-                let server_response: ServerMessage = serde_json::from_str(&text)?;
-                match server_response {
-                    ServerMessage::RoomCreated(payload) => {
-                        app.current_room = Some(RoomInfo {
-                            id: payload.room_id,
-                            name: payload.name,
-                        });
-                        app.status_message = "Room created successfully!".to_string();
-                        return Ok(());
+    // Task to listen for incoming messages from the server
+    tokio::spawn(async move {
+        while let Some(message_result) = read.next().await {
+            match message_result {
+                Ok(msg) => {
+                    if let Message::Text(text) = msg {
+                        if ws_incoming_tx.send(text).is_err() {
+                            // Main app has closed, exit the loop
+                            break;
+                        }
                     }
-                    ServerMessage::Error(payload) => return Err(payload.message.into()),
-                    _ => {}
+                }
+                Err(_) => {
+                    // Connection closed or error
+                    let _ = ws_incoming_tx.send("Connection to server lost.".to_string());
+                    break;
                 }
             }
         }
-    }
-    Err("No valid token".into())
-}
+    });
 
-async fn join_room(app: &mut App<'_>, room_id: &str) -> Result<(), Box<dyn Error>> {
-    let (ws_stream, _) = connect_async("ws://tunnel.sreus.tech:8080").await?;
-    let (mut write, mut read) = ws_stream.split();
-
-    if let Some(token) = &app.jwt {
-        let join_payload = JoinRoomPayload { token, room_id };
-        let join_message = ClientMessage {
-            typ: "joinRoom",
-            payload: join_payload,
-        };
-
-        let message_json = serde_json::to_string(&join_message)?;
-        write.send(Message::text(message_json)).await?;
-
-        while let Some(message) = read.next().await {
-            let message = message?;
-            if let Message::Text(text) = message {
-                let server_response: ServerMessage = serde_json::from_str(&text)?;
-                match server_response {
-                    ServerMessage::JoinedRoom(payload) => {
-                        app.current_room = Some(RoomInfo {
-                            id: payload.room_id,
-                            name: payload.name,
-                        });
-                        app.status_message = "Joined room successfully!".to_string();
-                        return Ok(());
-                    }
-                    ServerMessage::JoinRequestSent(payload) => {
-                        app.status_message = payload.message;
-                        return Ok(());
-                    }
-                    ServerMessage::Error(payload) => return Err(payload.message.into()),
-                    _ => {}
-                }
+    // Task to send outgoing messages from the app to the server
+    tokio::spawn(async move {
+        while let Some(json) = ws_outgoing_rx.recv().await {
+            if write.send(Message::text(json)).await.is_err() {
+                break;
             }
         }
-    }
-    Err("No valid token".into())
-}
+    });
 
-async fn send_message(app: &mut App<'_>, content: &str) -> Result<(), Box<dyn Error>> {
-    let (ws_stream, _) = connect_async("ws://tunnel.sreus.tech:8080").await?;
-    let (mut write, _read) = ws_stream.split();
-
-    if let (Some(token), Some(room)) = (&app.jwt, &app.current_room) {
-        let message_payload = MessagePayload {
-            token,
-            room_id: &room.id,
-            content,
-        };
-        let message = ClientMessage {
-            typ: "message",
-            payload: message_payload,
-        };
-
-        let message_json = serde_json::to_string(&message)?;
-        write.send(Message::text(message_json)).await?;
-    }
     Ok(())
 }
 
@@ -662,256 +390,105 @@ fn ui(f: &mut Frame, app: &mut App) {
         .constraints([
             Constraint::Length(3), // Title
             Constraint::Min(1),    // Main content
-            Constraint::Length(3), // Status/Footer
+            Constraint::Length(3), // Footer
         ])
         .split(f.area());
 
-    let title = Paragraph::new("radiochat")
+    let title = Paragraph::new("RadioChat :: E2EE")
         .style(Style::default().fg(Color::LightCyan))
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
     match app.current_screen {
-        CurrentScreen::AuthChoice => render_auth_choice(f, chunks[1]),
-        CurrentScreen::Login => render_login(f, app, chunks[1]),
-        CurrentScreen::Signup => render_signup(f, app, chunks[1]),
-        CurrentScreen::Main => render_main(f, app, chunks[1]),
+        CurrentScreen::RoomChoice => render_room_choice(f, chunks[1]),
         CurrentScreen::RoomCreation => render_room_creation(f, app, chunks[1]),
         CurrentScreen::RoomJoining => render_room_joining(f, app, chunks[1]),
+        CurrentScreen::InRoom => render_in_room(f, app, chunks[1]),
     }
 
     render_footer(f, app, chunks[2]);
 }
 
-fn render_auth_choice(f: &mut Frame, area: Rect) {
-    let auth_text = Text::from(vec![
-        Line::from("Welcome to RadioChat! "),
+fn render_room_choice(f: &mut Frame, area: Rect) {
+    let text = Text::from(vec![
+        Line::from("Welcome to the secure zone."),
         Line::from(""),
-        Line::from("Tune your radio frequencies to enter this new world of comms"),
+        Line::from("Press 'c' to CREATE a new encrypted room."),
+        Line::from("Press 'j' to JOIN an existing room."),
         Line::from(""),
-        Line::from("Press:"),
-        Line::from("  L - Login to existing account"),
-        Line::from("  S - Sign up for new account"),
-        Line::from("  Esc - Quit"),
+        Line::from("Press 'Esc' to quit."),
     ]);
-
-    let auth_widget = Paragraph::new(auth_text)
-        .style(Style::default().fg(Color::White))
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).title("Tune In"));
-    f.render_widget(auth_widget, area);
-}
-
-fn render_login(f: &mut Frame, app: &mut App, area: Rect) {
-    let login_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(3)])
-        .margin(1)
-        .split(area);
-
-    update_field_styles(app, false);
-    f.render_widget(&app.username_input, login_chunks[0]);
-    f.render_widget(&app.password_input, login_chunks[1]);
-}
-
-fn render_signup(f: &mut Frame, app: &mut App, area: Rect) {
-    let signup_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-        ])
-        .margin(1)
-        .split(area);
-
-    update_field_styles(app, true);
-    f.render_widget(&app.username_input, signup_chunks[0]);
-    f.render_widget(&app.password_input, signup_chunks[1]);
-    f.render_widget(&app.confirm_password_input, signup_chunks[2]);
-}
-
-fn render_main(f: &mut Frame, app: &mut App, area: Rect) {
-    match &app.current_room {
-        Some(room) => {
-            // Chat interface
-            let chat_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(1),    // Messages
-                    Constraint::Length(3), // Input
-                ])
-                .split(area);
-
-            // Messages area
-            let messages_text = if app.messages.is_empty() {
-                vec![Line::from("No messages yet. Start the conversation!")]
-            } else {
-                app.messages
-                    .iter()
-                    .map(|msg| {
-                        Line::from(format!(
-                            "[{}] {}: {}",
-                            msg.created_at.format("%H:%M:%S"),
-                            msg.author.username,
-                            msg.content
-                        ))
-                    })
-                    .collect()
-            };
-
-            let messages_widget = Paragraph::new(Text::from(messages_text))
-                .style(Style::default().fg(Color::White))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!("Room: {}", room.name)),
-                )
-                .wrap(Wrap { trim: true });
-            f.render_widget(messages_widget, chat_chunks[0]);
-
-            // Message input
-            f.render_widget(&app.message_input, chat_chunks[1]);
-        }
-        None => {
-            // Placeholder
-            let placeholder_text = Text::from(vec![
-                Line::from("Radiocheck finish. Welcome to the next gen comms app!"),
-                Line::from(""),
-                Line::from("Tune into your frequency"),
-                Line::from(""),
-                Line::from("📻 Press SUPER + n to create a new room"),
-                Line::from("🔗 Press SUPER + j to join a room by ID"),
-                Line::from(""),
-                Line::from("\"Broadcasting good vibes...\""),
-            ]);
-
-            let placeholder_widget = Paragraph::new(placeholder_text)
-                .style(Style::default().fg(Color::White))
-                .alignment(Alignment::Center)
-                .block(Block::default().borders(Borders::ALL).title("Main"));
-            f.render_widget(placeholder_widget, area);
-        }
-    }
+    let widget = Paragraph::new(text).alignment(Alignment::Center).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Choose an Action"),
+    );
+    f.render_widget(widget, area);
 }
 
 fn render_room_creation(f: &mut Frame, app: &mut App, area: Rect) {
-    let popup_area = centered_rect(60, 20, area);
-    f.render_widget(Clear, popup_area);
-
-    let create_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3)])
-        .margin(1)
-        .split(popup_area);
-
-    f.render_widget(&app.room_name_input, create_chunks[0]);
+    let text: Vec<Line> = app.messages.iter().map(|s| Line::from(s.clone())).collect();
+    let widget = Paragraph::new(Text::from(text))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Room Credentials"),
+        );
+    f.render_widget(widget, area);
 }
 
 fn render_room_joining(f: &mut Frame, app: &mut App, area: Rect) {
-    let popup_area = centered_rect(60, 20, area);
-    f.render_widget(Clear, popup_area);
-
-    let join_chunks = Layout::default()
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3)])
-        .margin(1)
-        .split(popup_area);
+        .constraints([Constraint::Length(3), Constraint::Length(3)])
+        .margin(2)
+        .split(area);
 
-    f.render_widget(&app.room_id_input, join_chunks[0]);
-}
-
-fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
-    let status_color = if app.status_message.contains("Failed")
-        || app.status_message.contains("Error")
-    {
-        Color::Red
-    } else if app.status_message.contains("Successful") || app.status_message.contains("created") {
-        Color::Green
-    } else {
-        Color::Yellow
-    };
-
-    let footer_text = match app.current_screen {
-        CurrentScreen::AuthChoice => &app.status_message,
-        CurrentScreen::Login => "Tab: Switch fields | Enter: Login | Esc: Back",
-        CurrentScreen::Signup => "Tab: Switch fields | Enter: Sign up | Esc: Back",
-        CurrentScreen::Main => {
-            if app.current_room.is_some() {
-                "Enter: Send message | Esc: Leave room"
-            } else {
-                "SUPER + n: New room | Super + j: Join room | Esc: Quit"
-            }
-        }
-        CurrentScreen::RoomCreation => "Enter: Create room | Esc: Cancel",
-        CurrentScreen::RoomJoining => "Enter: Join room | Esc: Cancel",
-    };
-
-    let footer = Paragraph::new(footer_text)
-        .style(Style::default().fg(status_color))
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL));
-    f.render_widget(footer, area);
-}
-
-fn update_field_styles(app: &mut App, is_signup: bool) {
-    // Reset all styles first
-    app.username_input
-        .set_style(Style::default().fg(Color::White));
-    app.password_input.set_style(
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::HIDDEN),
-    );
-    app.confirm_password_input.set_style(
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::HIDDEN),
-    );
-
-    // Highlight the currently editing field
+    // Highlight active field
+    app.room_id_input.set_style(Style::default());
+    app.room_key_input.set_style(Style::default());
     match app.currently_editing {
-        CurrentlyEditing::Username => {
-            app.username_input
-                .set_style(Style::default().fg(Color::Yellow));
-        }
-        CurrentlyEditing::Password => {
-            app.password_input.set_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::HIDDEN),
-            );
-        }
-        CurrentlyEditing::ConfirmPassword if is_signup => {
-            app.confirm_password_input.set_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::HIDDEN),
-            );
-        }
+        Some(CurrentlyEditing::RoomId) => app
+            .room_id_input
+            .set_style(Style::default().fg(Color::Yellow)),
+        Some(CurrentlyEditing::RoomKey) => app
+            .room_key_input
+            .set_style(Style::default().fg(Color::Yellow)),
         _ => {}
     }
+
+    f.render_widget(&app.room_id_input, chunks[0]);
+    f.render_widget(&app.room_key_input, chunks[1]);
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
+fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .split(area);
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+    let messages: Vec<ListItem> = app
+        .messages
+        .iter()
+        .map(|m| ListItem::new(m.clone()))
+        .collect();
+    let messages_list = List::new(messages).block(Block::default().borders(Borders::ALL).title(
+        format!("Room: {}", app.room_id.as_deref().unwrap_or("Unknown")),
+    ));
+    f.render_widget(messages_list, chunks[0]);
+
+    f.render_widget(&app.message_input, chunks[1]);
+}
+
+fn render_footer(f: &mut Frame, app: &App, area: Rect) {
+    let footer_text = Paragraph::new(app.status_message.as_str())
+        .style(Style::default().fg(Color::Yellow))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title("Status"));
+    f.render_widget(footer_text, area);
 }
 
 // --- Terminal Helper Functions ---
@@ -937,3 +514,4 @@ fn restore_terminal(
     terminal.show_cursor()?;
     Ok(())
 }
+
