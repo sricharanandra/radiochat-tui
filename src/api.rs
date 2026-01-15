@@ -1,48 +1,145 @@
 use serde::{Deserialize, Serialize};
 
-// --- Payloads Sent from Client to Server ---
+// ============================================================================
+// CLIENT → SERVER MESSAGES
+// ============================================================================
 
 #[derive(Serialize)]
 pub struct JoinRoomPayload<'a> {
-    #[serde(rename = "roomId")]
-    pub room_id: &'a str,
+    #[serde(rename = "roomId", skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<&'a str>,
+    #[serde(rename = "roomName", skip_serializing_if = "Option::is_none")]
+    pub room_name: Option<&'a str>,
 }
 
 #[derive(Serialize)]
 pub struct SendMessagePayload<'a> {
     #[serde(rename = "roomId")]
     pub room_id: &'a str,
-    // The encrypted message content, encoded as a hex string
     pub ciphertext: &'a str,
 }
 
-// A generic wrapper for all client-sent messages
+#[derive(Serialize)]
+pub struct CreateRoomPayload<'a> {
+    pub name: &'a str,
+    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<&'a str>,
+    #[serde(rename = "roomType")]
+    pub room_type: &'a str, // "public" or "private"
+}
+
+#[derive(Serialize)]
+pub struct ListRoomsPayload {
+    // Empty payload
+}
+
+// Generic wrapper for all client-sent messages
 #[derive(Serialize)]
 pub struct ClientMessage<'a, T> {
     #[serde(rename = "type")]
-    pub typ: &'a str,
+    pub message_type: &'a str,
     pub payload: T,
 }
 
-// --- Payloads Received from Server ---
+// ============================================================================
+// SERVER → CLIENT MESSAGES
+// ============================================================================
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct MessagePayload {
-    // The encrypted message content, encoded as a hex string
+    pub id: String,
+    pub username: String,
     pub ciphertext: String,
+    pub timestamp: String,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct SimpleMessagePayload {
+#[derive(Deserialize, Debug, Clone)]
+pub struct UserJoinedPayload {
+    pub username: String,
+    #[serde(rename = "userId")]
+    pub user_id: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct UserLeftPayload {
+    pub username: String,
+    #[serde(rename = "userId")]
+    pub user_id: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct RoomJoinedPayload {
+    #[serde(rename = "roomId")]
+    pub room_id: String,
+    #[serde(rename = "roomName")]
+    pub room_name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    #[serde(rename = "roomType")]
+    pub room_type: String,
+    #[serde(rename = "encryptedKey")]
+    pub encrypted_key: String,
+    pub messages: Vec<MessagePayload>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct RoomCreatedPayload {
+    #[serde(rename = "roomId")]
+    pub room_id: String,
+    #[serde(rename = "roomName")]
+    pub room_name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    #[serde(rename = "roomType")]
+    pub room_type: String,
+    #[serde(rename = "encryptedKey")]
+    pub encrypted_key: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct RoomInfo {
+    #[serde(rename = "roomId")]
+    pub room_id: String,
+    pub name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    #[serde(rename = "roomType")]
+    pub room_type: String,
+    #[serde(rename = "memberCount")]
+    pub member_count: usize,
+    #[serde(rename = "isJoined")]
+    pub is_joined: bool,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct RoomsListPayload {
+    #[serde(rename = "publicRooms")]
+    pub public_rooms: Vec<RoomInfo>,
+    #[serde(rename = "privateRooms")]
+    pub private_rooms: Vec<RoomInfo>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ErrorPayload {
     pub message: String,
 }
 
-// An enum to represent all possible incoming server message payloads
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
+pub struct InfoPayload {
+    pub message: String,
+}
+
+// Enum to represent all possible incoming server messages
+#[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "payload")]
 #[serde(rename_all = "camelCase")]
 pub enum ServerMessage {
     Message(MessagePayload),
-    Info(SimpleMessagePayload),
-    Error(SimpleMessagePayload),
+    UserJoined(UserJoinedPayload),
+    UserLeft(UserLeftPayload),
+    RoomJoined(RoomJoinedPayload),
+    RoomCreated(RoomCreatedPayload),
+    RoomsList(RoomsListPayload),
+    Info(InfoPayload),
+    Error(ErrorPayload),
 }

@@ -2,7 +2,7 @@ mod api;
 mod crypto;
 
 use crate::crypto::{decrypt, encrypt, generate_key, AesKey};
-use api::{ClientMessage, JoinRoomPayload, SendMessagePayload, ServerMessage};
+use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo};
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
     crossterm::{
@@ -22,19 +22,21 @@ use tui_textarea::TextArea;
 
 enum CurrentScreen {
     RoomChoice,
+    RoomList,
     RoomCreation,
+    CreateRoomInput,
     RoomJoining,
     InRoom,
 }
 
 enum CurrentlyEditing {
-    RoomId,
+    RoomName,
     RoomKey,
 }
 
 struct App<'a> {
     // Inputs
-    room_id_input: TextArea<'a>,
+    room_name_input: TextArea<'a>,
     room_key_input: TextArea<'a>,
     message_input: TextArea<'a>,
 
@@ -46,8 +48,15 @@ struct App<'a> {
 
     // Room Data
     room_id: Option<String>,
+    room_name: Option<String>,
     room_key: Option<AesKey>,
     messages: Vec<String>,
+    
+    // Room List
+    public_rooms: Vec<RoomInfo>,
+    private_rooms: Vec<RoomInfo>,
+    selected_room_index: usize,
+    viewing_private: bool,
 
     // WebSocket
     ws_sender: Option<mpsc::UnboundedSender<String>>,
@@ -55,9 +64,9 @@ struct App<'a> {
 
 impl<'a> Default for App<'a> {
     fn default() -> Self {
-        let mut room_id_input = TextArea::default();
-        room_id_input.set_placeholder_text("Enter the Room ID...");
-        room_id_input.set_block(Block::default().borders(Borders::ALL).title("Room ID"));
+        let mut room_name_input = TextArea::default();
+        room_name_input.set_placeholder_text("Enter room name (e.g., general)...");
+        room_name_input.set_block(Block::default().borders(Borders::ALL).title("Room Name"));
 
         let mut room_key_input = TextArea::default();
         room_key_input.set_placeholder_text("Enter the secret Room Key...");
@@ -68,7 +77,7 @@ impl<'a> Default for App<'a> {
         message_input.set_block(Block::default().borders(Borders::ALL).title("Message"));
 
         App {
-            room_id_input,
+            room_name_input,
             room_key_input,
             message_input,
             current_screen: CurrentScreen::RoomChoice,
@@ -76,8 +85,13 @@ impl<'a> Default for App<'a> {
             status_message: "Create or Join a secure room.".to_string(),
             should_quit: false,
             room_id: None,
+            room_name: None,
             room_key: None,
             messages: Vec::new(),
+            public_rooms: Vec::new(),
+            private_rooms: Vec::new(),
+            selected_room_index: 0,
+            viewing_private: false,
             ws_sender: None,
         }
     }
@@ -96,6 +110,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> io::Result<()> {
     let (ws_incoming_tx, mut ws_incoming_rx) = mpsc::unbounded_channel::<String>();
+
+    // Establish WebSocket connection at startup
+    if let Ok(()) = establish_connection(app, ws_incoming_tx.clone()).await {
+        app.status_message = "Connected! Create or Join a secure room.".to_string();
+    } else {
+        app.status_message = "Failed to connect to server. Check if server is running.".to_string();
+    }
 
     loop {
         terminal.draw(|f| ui(f, app))?;
@@ -121,6 +142,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                 if key.kind == KeyEventKind::Press {
                     match app.current_screen {
                         CurrentScreen::RoomChoice => handle_room_choice_screen(app, key).await,
+                        CurrentScreen::RoomList => handle_room_list_screen(app, key, ws_incoming_tx.clone()).await,
+                        CurrentScreen::CreateRoomInput => {
+                            handle_create_room_input_screen(app, key, ws_incoming_tx.clone()).await
+                        }
                         CurrentScreen::RoomCreation => {
                             handle_room_creation_screen(app, key, ws_incoming_tx.clone()).await
                         }
@@ -141,27 +166,24 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
 async fn handle_room_choice_screen(app: &mut App<'_>, key: event::KeyEvent) {
     match key.code {
         KeyCode::Char('c') | KeyCode::Char('C') => {
-            let new_room_id = hex::encode(rand::random::<[u8; 16]>());
-            let new_key = generate_key();
-
-            app.status_message =
-                format!("New Room Created! SAVE THESE DETAILS. Press Enter to continue.");
-            app.messages = vec![
-                "IMPORTANT: Share this Room ID and Key SECURELY with others.".to_string(),
-                "There is no way to recover them.".to_string(),
-                "".to_string(),
-                format!("Room ID: {}", new_room_id),
-                format!("Room Key: {}", hex::encode(new_key.as_slice())),
-            ];
-
-            app.room_id = Some(new_room_id);
-            app.room_key = Some(new_key);
-            app.current_screen = CurrentScreen::RoomCreation;
+            app.current_screen = CurrentScreen::CreateRoomInput;
+            app.currently_editing = Some(CurrentlyEditing::RoomName);
+            app.status_message = "Enter a name for your new room (e.g., team-chat)".to_string();
         }
         KeyCode::Char('j') | KeyCode::Char('J') => {
-            app.current_screen = CurrentScreen::RoomJoining;
-            app.currently_editing = Some(CurrentlyEditing::RoomId);
-            app.status_message = "Enter Room ID and Key to join.".to_string();
+            app.current_screen = CurrentScreen::RoomList;
+            app.status_message = "Loading rooms...".to_string();
+            
+            // Request room list
+            if let Some(ws_sender) = &app.ws_sender {
+                let list_message = ClientMessage {
+                    message_type: "listRooms",
+                    payload: ListRoomsPayload {},
+                };
+                if let Ok(json) = serde_json::to_string(&list_message) {
+                    let _ = ws_sender.send(json);
+                }
+            }
         }
         KeyCode::Esc => {
             app.should_quit = true;
@@ -170,19 +192,146 @@ async fn handle_room_choice_screen(app: &mut App<'_>, key: event::KeyEvent) {
     }
 }
 
+async fn handle_room_list_screen(
+    app: &mut App<'_>,
+    key: event::KeyEvent,
+    _ws_tx: mpsc::UnboundedSender<String>,
+) {
+    match key.code {
+        KeyCode::Up => {
+            if app.selected_room_index > 0 {
+                app.selected_room_index -= 1;
+            }
+        }
+        KeyCode::Down => {
+            let room_count = if app.viewing_private {
+                app.private_rooms.len()
+            } else {
+                app.public_rooms.len()
+            };
+            if app.selected_room_index + 1 < room_count {
+                app.selected_room_index += 1;
+            }
+        }
+        KeyCode::Tab => {
+            app.viewing_private = !app.viewing_private;
+            app.selected_room_index = 0;
+        }
+        KeyCode::Enter => {
+            let room_name = if app.viewing_private {
+                app.private_rooms.get(app.selected_room_index).map(|r| r.name.clone())
+            } else {
+                app.public_rooms.get(app.selected_room_index).map(|r| r.name.clone())
+            };
+            
+            if let Some(name) = room_name {
+                app.status_message = format!("Joining room: {}", name);
+                
+                // Join room using existing WebSocket connection
+                if let Some(ws_sender) = &app.ws_sender {
+                    let join_payload = JoinRoomPayload {
+                        room_id: None,
+                        room_name: Some(&name),
+                    };
+                    let join_message = ClientMessage {
+                        message_type: "joinRoom",
+                        payload: join_payload,
+                    };
+                    if let Ok(json) = serde_json::to_string(&join_message) {
+                        if ws_sender.send(json).is_ok() {
+                            app.messages.clear();
+                            app.current_screen = CurrentScreen::InRoom;
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            // Refresh room list
+            if let Some(ws_sender) = &app.ws_sender {
+                let list_message = ClientMessage {
+                    message_type: "listRooms",
+                    payload: ListRoomsPayload {},
+                };
+                if let Ok(json) = serde_json::to_string(&list_message) {
+                    let _ = ws_sender.send(json);
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.current_screen = CurrentScreen::RoomChoice;
+        }
+        _ => {}
+    }
+}
+
+async fn handle_create_room_input_screen(
+    app: &mut App<'_>,
+    key: event::KeyEvent,
+    _ws_tx: mpsc::UnboundedSender<String>,
+) {
+    match key.code {
+        KeyCode::Enter => {
+            let room_name = app.room_name_input.lines().join("");
+            if room_name.is_empty() {
+                app.status_message = "Room name cannot be empty!".to_string();
+                return;
+            }
+            
+            app.status_message = "Creating room...".to_string();
+            
+            // Create room using existing WebSocket connection
+            if let Some(ws_sender) = &app.ws_sender {
+                let create_payload = CreateRoomPayload {
+                    name: &room_name,
+                    display_name: None,
+                    room_type: "public",
+                };
+                let create_message = ClientMessage {
+                    message_type: "createRoom",
+                    payload: create_payload,
+                };
+                if let Ok(json) = serde_json::to_string(&create_message) {
+                    if ws_sender.send(json).is_ok() {
+                        app.current_screen = CurrentScreen::RoomCreation;
+                    }
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.current_screen = CurrentScreen::RoomChoice;
+        }
+        _ => {
+            app.room_name_input.input(key);
+        }
+    }
+}
+
 async fn handle_room_creation_screen(
     app: &mut App<'_>,
     key: event::KeyEvent,
-    ws_tx: mpsc::UnboundedSender<String>,
+    _ws_tx: mpsc::UnboundedSender<String>,
 ) {
     if let KeyCode::Enter = key.code {
-        app.status_message = "Connecting...".to_string();
-        if connect(app, ws_tx).await.is_ok() {
-            app.messages.clear();
-            app.current_screen = CurrentScreen::InRoom;
-            app.status_message = "Connected to room!".to_string();
-        } else {
-            app.status_message = "Failed to connect.".to_string();
+        if let Some(room_name) = &app.room_name {
+            // Join the room we just created using joinRoom message
+            if let Some(ws_sender) = &app.ws_sender {
+                let join_payload = JoinRoomPayload {
+                    room_id: None,
+                    room_name: Some(room_name),
+                };
+                let join_message = ClientMessage {
+                    message_type: "joinRoom",
+                    payload: join_payload,
+                };
+                if let Ok(json) = serde_json::to_string(&join_message) {
+                    if ws_sender.send(json).is_ok() {
+                        app.messages.clear();
+                        app.current_screen = CurrentScreen::InRoom;
+                        app.status_message = format!("Joined room: #{}", room_name);
+                    }
+                }
+            }
         }
     }
 }
@@ -194,18 +343,18 @@ async fn handle_room_joining_screen(
 ) {
     match key.code {
         KeyCode::Enter => {
-            let room_id = app.room_id_input.lines().join("");
+            let room_name = app.room_name_input.lines().join("");
             let room_key_hex = app.room_key_input.lines().join("");
 
-            if room_id.is_empty() || room_key_hex.is_empty() {
-                app.status_message = "Both Room ID and Key are required.".to_string();
+            if room_name.is_empty() || room_key_hex.is_empty() {
+                app.status_message = "Both room name and key are required.".to_string();
                 return;
             }
 
             let key_bytes = match hex::decode(room_key_hex) {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    app.status_message = "Invalid Room Key format. Must be hex.".to_string();
+                    app.status_message = "Invalid room key format. Must be hex.".to_string();
                     return;
                 }
             };
@@ -213,39 +362,39 @@ async fn handle_room_joining_screen(
             let key = AesKey::from_slice(&key_bytes);
 
             // Set state before attempting to connect
-            app.room_id = Some(room_id);
+            app.room_name = Some(room_name.clone());
             app.room_key = Some(*key);
 
             app.status_message = "Connecting...".to_string();
-            if connect(app, ws_tx).await.is_ok() {
+            if connect_to_room_by_name(app, ws_tx, &room_name).await.is_ok() {
                 app.current_screen = CurrentScreen::InRoom;
-                app.status_message = "Connected to room!".to_string();
+                app.status_message = format!("Connected to room: #{}", room_name);
             } else {
                 app.status_message =
-                    "Failed to connect. Check Room ID/Key and network.".to_string();
+                    "Failed to connect. Check room name/key and network.".to_string();
                 // Clear invalid state
-                app.room_id = None;
+                app.room_name = None;
                 app.room_key = None;
             }
         }
         KeyCode::Tab => {
             app.currently_editing = match app.currently_editing {
-                Some(CurrentlyEditing::RoomId) => Some(CurrentlyEditing::RoomKey),
-                _ => Some(CurrentlyEditing::RoomId),
+                Some(CurrentlyEditing::RoomName) => Some(CurrentlyEditing::RoomKey),
+                _ => Some(CurrentlyEditing::RoomName),
             };
         }
         KeyCode::Esc => {
             app.current_screen = CurrentScreen::RoomChoice;
             app.status_message = "Create or Join a secure room.".to_string();
-            app.room_id_input.move_cursor(tui_textarea::CursorMove::End);
+            app.room_name_input.move_cursor(tui_textarea::CursorMove::End);
             app.room_key_input
                 .move_cursor(tui_textarea::CursorMove::End);
         }
         _ => {
             let input = Event::Key(key);
             match app.currently_editing {
-                Some(CurrentlyEditing::RoomId) => {
-                    app.room_id_input.input(input);
+                Some(CurrentlyEditing::RoomName) => {
+                    app.room_name_input.input(input);
                 }
                 Some(CurrentlyEditing::RoomKey) => {
                     app.room_key_input.input(input);
@@ -271,7 +420,7 @@ async fn handle_in_room_screen(app: &mut App<'_>, key: event::KeyEvent) {
                                 ciphertext: &ciphertext,
                             };
                             let msg = ClientMessage {
-                                typ: "message",
+                                message_type: "sendMessage",
                                 payload,
                             };
                             if let Ok(json) = serde_json::to_string(&msg) {
@@ -311,20 +460,139 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
         ServerMessage::Message(payload) => {
             if let Some(key) = &app.room_key {
                 match decrypt(key, &payload.ciphertext) {
-                    Ok(plaintext) => app.messages.push(plaintext),
+                    Ok(plaintext) => {
+                        let formatted = format!("[{}] {}", payload.username, plaintext);
+                        app.messages.push(formatted);
+                    }
                     Err(_) => app
                         .messages
                         .push("[DECRYPTION_ERROR] Received invalid message".to_string()),
                 }
             }
         }
+        ServerMessage::UserJoined(payload) => {
+            app.messages
+                .push(format!("→ {} joined the room", payload.username));
+        }
+        ServerMessage::UserLeft(payload) => {
+            app.messages
+                .push(format!("← {} left the room", payload.username));
+        }
+        ServerMessage::RoomJoined(payload) => {
+            app.status_message = format!("Joined room: {}", payload.display_name);
+            
+            // Store room info
+            app.room_id = Some(payload.room_id.clone());
+            app.room_name = Some(payload.room_name.clone());
+            
+            // Store the room key from the server
+            if !payload.encrypted_key.is_empty() {
+                // For now, use the hex key directly as the AES key
+                // In production, this would be encrypted per-user
+                if let Ok(key_bytes) = hex::decode(&payload.encrypted_key) {
+                    if key_bytes.len() == 32 {
+                        use crate::crypto::AesKey;
+                        app.room_key = Some(*AesKey::from_slice(&key_bytes));
+                    }
+                }
+            }
+            
+            // Load message history
+            if let Some(key) = &app.room_key {
+                for msg in payload.messages {
+                    match decrypt(key, &msg.ciphertext) {
+                        Ok(plaintext) => {
+                            let formatted = format!("[{}] {}", msg.username, plaintext);
+                            app.messages.push(formatted);
+                        }
+                        Err(_) => app
+                            .messages
+                            .push("[DECRYPTION_ERROR] Could not decrypt old message".to_string()),
+                    }
+                }
+            }
+        }
+        ServerMessage::RoomCreated(payload) => {
+            app.status_message = format!("Room created: {}", payload.display_name);
+            app.room_id = Some(payload.room_id);
+            app.room_name = Some(payload.room_name);
+            
+            // Store the room key from the server
+            if !payload.encrypted_key.is_empty() {
+                if let Ok(key_bytes) = hex::decode(&payload.encrypted_key) {
+                    if key_bytes.len() == 32 {
+                        use crate::crypto::AesKey;
+                        app.room_key = Some(*AesKey::from_slice(&key_bytes));
+                    }
+                }
+            }
+            
+            app.messages = vec![
+                format!("Room {} created successfully!", payload.display_name),
+                "".to_string(),
+                "Press Enter to join the room".to_string(),
+            ];
+        }
+        ServerMessage::RoomsList(payload) => {
+            app.public_rooms = payload.public_rooms;
+            app.private_rooms = payload.private_rooms;
+            app.selected_room_index = 0;
+            app.status_message = format!(
+                "{} public, {} private rooms. Use ↑↓ to navigate, Enter to join, Tab to switch, R to refresh",
+                app.public_rooms.len(),
+                app.private_rooms.len()
+            );
+        }
         ServerMessage::Info(payload) => {
             app.messages.push(format!("[SERVER] {}", payload.message));
         }
         ServerMessage::Error(payload) => {
             app.status_message = format!("[ERROR] {}", payload.message);
+            app.messages.push(format!("[ERROR] {}", payload.message));
         }
     }
+}
+
+async fn establish_connection(
+    app: &mut App<'_>,
+    ws_incoming_tx: mpsc::UnboundedSender<String>,
+) -> Result<(), Box<dyn Error>> {
+    let (ws_stream, _) = connect_async("ws://localhost:8081/ws").await?;
+    let (mut write, mut read) = ws_stream.split();
+
+    // Create a channel for sending messages to the WebSocket task
+    let (ws_outgoing_tx, mut ws_outgoing_rx) = mpsc::unbounded_channel::<String>();
+    app.ws_sender = Some(ws_outgoing_tx);
+
+    // Task to listen for incoming messages from the server
+    tokio::spawn(async move {
+        while let Some(message_result) = read.next().await {
+            match message_result {
+                Ok(msg) => {
+                    if let Message::Text(text) = msg {
+                        if ws_incoming_tx.send(text).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => {
+                    let _ = ws_incoming_tx.send("Connection to server lost.".to_string());
+                    break;
+                }
+            }
+        }
+    });
+
+    // Task to send outgoing messages from the app to the server
+    tokio::spawn(async move {
+        while let Some(json) = ws_outgoing_rx.recv().await {
+            if write.send(Message::text(json)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    Ok(())
 }
 
 async fn connect(
@@ -333,7 +601,7 @@ async fn connect(
 ) -> Result<(), Box<dyn Error>> {
     let room_id = app.room_id.as_ref().ok_or("Room ID not set")?;
 
-    let (ws_stream, _) = connect_async("ws://tunnel.sreus.tech:8080").await?;
+    let (ws_stream, _) = connect_async("ws://localhost:8081/ws").await?;
     let (mut write, mut read) = ws_stream.split();
 
     // Create a channel for sending messages to the WebSocket task
@@ -341,9 +609,12 @@ async fn connect(
     app.ws_sender = Some(ws_outgoing_tx);
 
     // Join the room
-    let join_payload = JoinRoomPayload { room_id };
+    let join_payload = JoinRoomPayload {
+        room_id: Some(room_id),
+        room_name: None,
+    };
     let join_message = ClientMessage {
-        typ: "joinRoom",
+        message_type: "joinRoom",
         payload: join_payload,
     };
     let message_json = serde_json::to_string(&join_message)?;
@@ -363,6 +634,126 @@ async fn connect(
                 }
                 Err(_) => {
                     // Connection closed or error
+                    let _ = ws_incoming_tx.send("Connection to server lost.".to_string());
+                    break;
+                }
+            }
+        }
+    });
+
+    // Task to send outgoing messages from the app to the server
+    tokio::spawn(async move {
+        while let Some(json) = ws_outgoing_rx.recv().await {
+            if write.send(Message::text(json)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    Ok(())
+}
+
+async fn connect_to_room_by_name(
+    app: &mut App<'_>,
+    ws_incoming_tx: mpsc::UnboundedSender<String>,
+    room_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    let (ws_stream, _) = connect_async("ws://localhost:8081/ws").await?;
+    let (mut write, mut read) = ws_stream.split();
+
+    // Create a channel for sending messages to the WebSocket task
+    let (ws_outgoing_tx, mut ws_outgoing_rx) = mpsc::unbounded_channel::<String>();
+    app.ws_sender = Some(ws_outgoing_tx.clone());
+
+    // Join the room by name
+    let join_payload = JoinRoomPayload {
+        room_id: None,
+        room_name: Some(room_name),
+    };
+    let join_message = ClientMessage {
+        message_type: "joinRoom",
+        payload: join_payload,
+    };
+    let message_json = serde_json::to_string(&join_message)?;
+    write.send(Message::text(message_json)).await?;
+
+    // Request room list
+    let list_message = ClientMessage {
+        message_type: "listRooms",
+        payload: ListRoomsPayload {},
+    };
+    let list_json = serde_json::to_string(&list_message)?;
+    let _ = ws_outgoing_tx.send(list_json);
+
+    // Task to listen for incoming messages from the server
+    tokio::spawn(async move {
+        while let Some(message_result) = read.next().await {
+            match message_result {
+                Ok(msg) => {
+                    if let Message::Text(text) = msg {
+                        if ws_incoming_tx.send(text).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => {
+                    let _ = ws_incoming_tx.send("Connection to server lost.".to_string());
+                    break;
+                }
+            }
+        }
+    });
+
+    // Task to send outgoing messages from the app to the server
+    tokio::spawn(async move {
+        while let Some(json) = ws_outgoing_rx.recv().await {
+            if write.send(Message::text(json)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    Ok(())
+}
+
+async fn create_room(
+    app: &mut App<'_>,
+    ws_incoming_tx: mpsc::UnboundedSender<String>,
+    room_name: &str,
+    room_type: &str,
+) -> Result<(), Box<dyn Error>> {
+    let (ws_stream, _) = connect_async("ws://localhost:8081/ws").await?;
+    let (mut write, mut read) = ws_stream.split();
+
+    // Create a channel for sending messages to the WebSocket task
+    let (ws_outgoing_tx, mut ws_outgoing_rx) = mpsc::unbounded_channel::<String>();
+    app.ws_sender = Some(ws_outgoing_tx);
+
+    // Create the room
+    let create_payload = CreateRoomPayload {
+        name: room_name,
+        display_name: None,
+        room_type,
+    };
+    let create_message = ClientMessage {
+        message_type: "createRoom",
+        payload: create_payload,
+    };
+    let message_json = serde_json::to_string(&create_message)?;
+    write.send(Message::text(message_json)).await?;
+
+    // Task to listen for incoming messages from the server
+    tokio::spawn(async move {
+        while let Some(message_result) = read.next().await {
+            match message_result {
+                Ok(msg) => {
+                    if let Message::Text(text) = msg {
+                        if ws_incoming_tx.send(text).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => {
                     let _ = ws_incoming_tx.send("Connection to server lost.".to_string());
                     break;
                 }
@@ -402,6 +793,8 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     match app.current_screen {
         CurrentScreen::RoomChoice => render_room_choice(f, chunks[1]),
+        CurrentScreen::RoomList => render_room_list(f, app, chunks[1]),
+        CurrentScreen::CreateRoomInput => render_create_room_input(f, app, chunks[1]),
         CurrentScreen::RoomCreation => render_room_creation(f, app, chunks[1]),
         CurrentScreen::RoomJoining => render_room_joining(f, app, chunks[1]),
         CurrentScreen::InRoom => render_in_room(f, app, chunks[1]),
@@ -412,12 +805,12 @@ fn ui(f: &mut Frame, app: &mut App) {
 
 fn render_room_choice(f: &mut Frame, area: Rect) {
     let text = Text::from(vec![
-        Line::from("Welcome to the secure zone."),
+        Line::from("Welcome to RadioChat - E2EE Chat"),
         Line::from(""),
-        Line::from("Press 'c' to CREATE a new encrypted room."),
-        Line::from("Press 'j' to JOIN an existing room."),
+        Line::from("Press 'c' to CREATE a new room"),
+        Line::from("Press 'j' to JOIN / browse rooms"),
         Line::from(""),
-        Line::from("Press 'Esc' to quit."),
+        Line::from("Press 'Esc' to quit"),
     ]);
     let widget = Paragraph::new(text).alignment(Alignment::Center).block(
         Block::default()
@@ -425,6 +818,58 @@ fn render_room_choice(f: &mut Frame, area: Rect) {
             .title("Choose an Action"),
     );
     f.render_widget(widget, area);
+}
+
+fn render_room_list(f: &mut Frame, app: &App, area: Rect) {
+    let rooms_to_display = if app.viewing_private {
+        &app.private_rooms
+    } else {
+        &app.public_rooms
+    };
+    
+    let room_type = if app.viewing_private { "PRIVATE" } else { "PUBLIC" };
+    
+    let items: Vec<ListItem> = rooms_to_display
+        .iter()
+        .enumerate()
+        .map(|(i, room)| {
+            let style = if i == app.selected_room_index {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            let content = format!(
+                "{} ({} members)",
+                room.display_name,
+                room.member_count
+            );
+            ListItem::new(content).style(style)
+        })
+        .collect();
+    
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("{} Rooms - Use ↑↓ to navigate, Enter to join, Tab to switch, R to refresh, Esc to go back", room_type))
+        );
+    
+    f.render_widget(list, area);
+}
+
+fn render_create_room_input(f: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(1)])
+        .margin(2)
+        .split(area);
+    
+    f.render_widget(&app.room_name_input, chunks[0]);
+    
+    let help_text = Paragraph::new("Enter a room name (e.g., 'general', 'team-chat')\nPress Enter to create, Esc to cancel")
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title("Help"));
+    f.render_widget(help_text, chunks[1]);
 }
 
 fn render_room_creation(f: &mut Frame, app: &mut App, area: Rect) {
@@ -448,11 +893,11 @@ fn render_room_joining(f: &mut Frame, app: &mut App, area: Rect) {
         .split(area);
 
     // Highlight active field
-    app.room_id_input.set_style(Style::default());
+    app.room_name_input.set_style(Style::default());
     app.room_key_input.set_style(Style::default());
     match app.currently_editing {
-        Some(CurrentlyEditing::RoomId) => app
-            .room_id_input
+        Some(CurrentlyEditing::RoomName) => app
+            .room_name_input
             .set_style(Style::default().fg(Color::Yellow)),
         Some(CurrentlyEditing::RoomKey) => app
             .room_key_input
@@ -460,7 +905,7 @@ fn render_room_joining(f: &mut Frame, app: &mut App, area: Rect) {
         _ => {}
     }
 
-    f.render_widget(&app.room_id_input, chunks[0]);
+    f.render_widget(&app.room_name_input, chunks[0]);
     f.render_widget(&app.room_key_input, chunks[1]);
 }
 
