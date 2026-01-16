@@ -1,12 +1,16 @@
 mod api;
 mod crypto;
+mod clipboard;
+mod config;
 
 use crate::crypto::{decrypt, encrypt, generate_key, AesKey};
+use crate::clipboard::ClipboardManager;
+use crate::config::Config;
 use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo};
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
     crossterm::{
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
@@ -27,6 +31,7 @@ enum CurrentScreen {
     CreateRoomInput,
     RoomJoining,
     InRoom,
+    QuitConfirmation,
 }
 
 enum CurrentlyEditing {
@@ -60,6 +65,10 @@ struct App<'a> {
 
     // WebSocket
     ws_sender: Option<mpsc::UnboundedSender<String>>,
+    
+    // Clipboard & Config
+    clipboard: Option<ClipboardManager>,
+    config: Config,
 }
 
 impl<'a> Default for App<'a> {
@@ -75,6 +84,11 @@ impl<'a> Default for App<'a> {
         let mut message_input = TextArea::default();
         message_input.set_placeholder_text("Type your encrypted message...");
         message_input.set_block(Block::default().borders(Borders::ALL).title("Message"));
+
+        let clipboard = ClipboardManager::new().ok();
+        if clipboard.is_none() {
+            eprintln!("Warning: Failed to initialize clipboard");
+        }
 
         App {
             room_name_input,
@@ -93,6 +107,8 @@ impl<'a> Default for App<'a> {
             selected_room_index: 0,
             viewing_private: false,
             ws_sender: None,
+            clipboard,
+            config: Config::load(),
         }
     }
 }
@@ -140,6 +156,12 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    // Global handler for Ctrl+Esc to show quit confirmation
+                    if key.code == KeyCode::Esc && key.modifiers.contains(KeyModifiers::CONTROL) {
+                        app.current_screen = CurrentScreen::QuitConfirmation;
+                        continue;
+                    }
+                    
                     match app.current_screen {
                         CurrentScreen::RoomChoice => handle_room_choice_screen(app, key).await,
                         CurrentScreen::RoomList => handle_room_list_screen(app, key, ws_incoming_tx.clone()).await,
@@ -153,6 +175,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                             handle_room_joining_screen(app, key, ws_incoming_tx.clone()).await
                         }
                         CurrentScreen::InRoom => handle_in_room_screen(app, key).await,
+                        CurrentScreen::QuitConfirmation => handle_quit_confirmation_screen(app, key),
                     }
                 }
             }
@@ -184,9 +207,6 @@ async fn handle_room_choice_screen(app: &mut App<'_>, key: event::KeyEvent) {
                     let _ = ws_sender.send(json);
                 }
             }
-        }
-        KeyCode::Esc => {
-            app.should_quit = true;
         }
         _ => {}
     }
@@ -406,6 +426,55 @@ async fn handle_room_joining_screen(
 }
 
 async fn handle_in_room_screen(app: &mut App<'_>, key: event::KeyEvent) {
+    // Handle clipboard keybindings
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                // Ctrl+Shift+C: Copy text from input field
+                if let Some(clipboard) = &mut app.clipboard {
+                    let text = app.message_input.lines().join("\n");
+                    if !text.is_empty() {
+                        match clipboard.copy_text(&text) {
+                            Ok(_) => app.status_message = "Text copied to clipboard".to_string(),
+                            Err(e) => app.status_message = format!("Failed to copy: {}", e),
+                        }
+                    }
+                }
+                return;
+            }
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                // Ctrl+Shift+V: Paste text
+                if let Some(clipboard) = &mut app.clipboard {
+                    match clipboard.paste_text() {
+                        Ok(text) => {
+                            // Insert text at cursor position
+                            for line in text.lines() {
+                                app.message_input.insert_str(line);
+                                app.message_input.insert_newline();
+                            }
+                            app.status_message = "Text pasted from clipboard".to_string();
+                        }
+                        Err(e) => app.status_message = format!("Failed to paste: {}", e),
+                    }
+                }
+                return;
+            }
+            KeyCode::Char('v') => {
+                // Ctrl+V: Paste image (for future implementation)
+                if let Some(clipboard) = &mut app.clipboard {
+                    if clipboard.has_image() {
+                        app.status_message = "Image paste not yet implemented".to_string();
+                        // TODO: Implement image compression, encryption, and upload
+                    } else {
+                        app.status_message = "No image in clipboard".to_string();
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+    
     match key.code {
         KeyCode::Enter => {
             let content = app.message_input.lines().join("\n");
@@ -445,11 +514,29 @@ async fn handle_in_room_screen(app: &mut App<'_>, key: event::KeyEvent) {
             }
         }
         KeyCode::Esc => {
-            app.should_quit = true; // For simplicity, Esc now quits the app.
+            // Esc does nothing in chat (will be used for vim mode later)
+            // Use Ctrl+Esc to quit
         }
         _ => {
             app.message_input.input(Event::Key(key));
         }
+    }
+}
+
+fn handle_quit_confirmation_screen(app: &mut App<'_>, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.should_quit = true;
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            // Return to the previous screen (InRoom if in a room, otherwise RoomChoice)
+            if app.room_id.is_some() {
+                app.current_screen = CurrentScreen::InRoom;
+            } else {
+                app.current_screen = CurrentScreen::RoomChoice;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -557,7 +644,8 @@ async fn establish_connection(
     app: &mut App<'_>,
     ws_incoming_tx: mpsc::UnboundedSender<String>,
 ) -> Result<(), Box<dyn Error>> {
-    let (ws_stream, _) = connect_async("ws://localhost:8081/ws").await?;
+    let ws_url = &app.config.server.url;
+    let (ws_stream, _) = connect_async(ws_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
     // Create a channel for sending messages to the WebSocket task
@@ -601,7 +689,7 @@ async fn connect(
 ) -> Result<(), Box<dyn Error>> {
     let room_id = app.room_id.as_ref().ok_or("Room ID not set")?;
 
-    let (ws_stream, _) = connect_async("ws://localhost:8081/ws").await?;
+    let (ws_stream, _) = connect_async(&app.config.server.url).await?;
     let (mut write, mut read) = ws_stream.split();
 
     // Create a channel for sending messages to the WebSocket task
@@ -658,7 +746,7 @@ async fn connect_to_room_by_name(
     ws_incoming_tx: mpsc::UnboundedSender<String>,
     room_name: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let (ws_stream, _) = connect_async("ws://localhost:8081/ws").await?;
+    let (ws_stream, _) = connect_async(&app.config.server.url).await?;
     let (mut write, mut read) = ws_stream.split();
 
     // Create a channel for sending messages to the WebSocket task
@@ -722,7 +810,7 @@ async fn create_room(
     room_name: &str,
     room_type: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let (ws_stream, _) = connect_async("ws://localhost:8081/ws").await?;
+    let (ws_stream, _) = connect_async(&app.config.server.url).await?;
     let (mut write, mut read) = ws_stream.split();
 
     // Create a channel for sending messages to the WebSocket task
@@ -798,6 +886,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         CurrentScreen::RoomCreation => render_room_creation(f, app, chunks[1]),
         CurrentScreen::RoomJoining => render_room_joining(f, app, chunks[1]),
         CurrentScreen::InRoom => render_in_room(f, app, chunks[1]),
+        CurrentScreen::QuitConfirmation => render_quit_confirmation(f, chunks[1]),
     }
 
     render_footer(f, app, chunks[2]);
@@ -810,7 +899,7 @@ fn render_room_choice(f: &mut Frame, area: Rect) {
         Line::from("Press 'c' to CREATE a new room"),
         Line::from("Press 'j' to JOIN / browse rooms"),
         Line::from(""),
-        Line::from("Press 'Esc' to quit"),
+        Line::from("Press 'Ctrl+Esc' to quit"),
     ]);
     let widget = Paragraph::new(text).alignment(Alignment::Center).block(
         Block::default()
@@ -928,6 +1017,33 @@ fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(&app.message_input, chunks[1]);
 }
 
+fn render_quit_confirmation(f: &mut Frame, area: Rect) {
+    // Center the dialog
+    let dialog_area = centered_rect(60, 30, area);
+    
+    let text = Text::from(vec![
+        Line::from(""),
+        Line::from(""),
+        Line::from("Are you sure you want to quit?").alignment(Alignment::Center),
+        Line::from(""),
+        Line::from("Press 'y' to quit").alignment(Alignment::Center),
+        Line::from("Press 'n' or Esc to cancel").alignment(Alignment::Center),
+    ]);
+    
+    let widget = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Quit Confirmation")
+                .border_style(Style::default().fg(Color::Red))
+        )
+        .alignment(Alignment::Center);
+    
+    // Clear the background
+    f.render_widget(Clear, dialog_area);
+    f.render_widget(widget, dialog_area);
+}
+
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let footer_text = Paragraph::new(app.status_message.as_str())
         .style(Style::default().fg(Color::Yellow))
@@ -958,5 +1074,26 @@ fn restore_terminal(
     )?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Helper function to create a centered rectangle for dialogs
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }
 
