@@ -203,8 +203,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
             let event = event::read()?;
             match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    // Global handler for Ctrl+Esc to show quit confirmation
-                    if key.code == KeyCode::Esc && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    // Global handler for Ctrl+Esc or Ctrl+C to show quit confirmation
+                    if (key.code == KeyCode::Esc && key.modifiers.contains(KeyModifiers::CONTROL))
+                        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+                    {
                         app.current_screen = CurrentScreen::QuitConfirmation;
                         continue;
                     }
@@ -676,10 +678,10 @@ async fn handle_normal_mode(app: &mut App<'_>, key: event::KeyEvent) {
             send_message(app).await;
         }
 
-        // Command mode
+        // Command mode - for now, just : triggers quit confirmation
         KeyCode::Char(':') => {
-            // TODO: Implement command mode for :q, :q!, :w, etc.
-            app.status_message = "Command mode not yet implemented (use Ctrl+Esc to quit)".to_string();
+            // Show quit confirmation (simplified command mode)
+            app.current_screen = CurrentScreen::QuitConfirmation;
         }
 
         _ => {
@@ -1251,7 +1253,7 @@ fn render_room_choice(f: &mut Frame, area: Rect) {
         Line::from("Press 'c' to CREATE a new room"),
         Line::from("Press 'j' to JOIN / browse rooms"),
         Line::from(""),
-        Line::from("Press 'Ctrl+Esc' to quit"),
+        Line::from("Press ':' or 'Ctrl+C' to quit"),
     ]);
     let widget = Paragraph::new(text).alignment(Alignment::Center).block(
         Block::default()
