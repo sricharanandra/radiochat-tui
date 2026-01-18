@@ -2,15 +2,17 @@ mod api;
 mod crypto;
 mod clipboard;
 mod config;
+mod vim;
 
-use crate::crypto::{decrypt, encrypt, generate_key, AesKey};
+use crate::crypto::{decrypt, encrypt, AesKey};
 use crate::clipboard::ClipboardManager;
 use crate::config::Config;
+use crate::vim::{VimMode, VimState};
 use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo};
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
     crossterm::{
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind},
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
@@ -24,6 +26,7 @@ use tui_textarea::TextArea;
 
 // --- Application State ---
 
+#[derive(PartialEq)]
 enum CurrentScreen {
     RoomChoice,
     RoomList,
@@ -50,6 +53,8 @@ struct App<'a> {
     currently_editing: Option<CurrentlyEditing>,
     status_message: String,
     should_quit: bool,
+    vim_state: VimState,
+    message_scroll_offset: usize,
 
     // Room Data
     room_id: Option<String>,
@@ -65,6 +70,8 @@ struct App<'a> {
 
     // WebSocket
     ws_sender: Option<mpsc::UnboundedSender<String>>,
+    reconnect_attempts: usize,
+    is_reconnecting: bool,
     
     // Clipboard & Config
     clipboard: Option<ClipboardManager>,
@@ -107,8 +114,12 @@ impl<'a> Default for App<'a> {
             selected_room_index: 0,
             viewing_private: false,
             ws_sender: None,
+            reconnect_attempts: 0,
+            is_reconnecting: false,
             clipboard,
             config: Config::load(),
+            vim_state: VimState::default(),
+            message_scroll_offset: 0,
         }
     }
 }
@@ -143,19 +154,55 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
 
         // Handle incoming WebSocket messages without blocking UI
         if let Ok(text) = ws_incoming_rx.try_recv() {
-            match serde_json::from_str::<ServerMessage>(&text) {
-                Ok(server_msg) => handle_server_message(app, server_msg),
-                Err(_) => {
-                    // Raw info messages from the server
-                    app.messages.push(format!("[SERVER] {}", text));
+            // Check for disconnect signal
+            if text == "__DISCONNECT__" {
+                app.messages.push("[SYSTEM] Connection lost. Attempting to reconnect...".to_string());
+                app.ws_sender = None;
+                
+                // Attempt reconnection in background
+                if app.current_screen == CurrentScreen::InRoom {
+                    if let Some(room_id) = app.room_id.clone() {
+                        // Try to reconnect and rejoin the room
+                        match establish_connection(app, ws_incoming_tx.clone()).await {
+                            Ok(_) => {
+                                // Rejoin the room after reconnection
+                                if let Some(sender) = &app.ws_sender {
+                                    let join_payload = JoinRoomPayload {
+                                        room_id: Some(&room_id),
+                                        room_name: None,
+                                    };
+                                    let join_msg = ClientMessage {
+                                        message_type: "joinRoom",
+                                        payload: join_payload,
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&join_msg) {
+                                        let _ = sender.send(json);
+                                    }
+                                }
+                                app.messages.push("[SYSTEM] Reconnected successfully!".to_string());
+                            }
+                            Err(_) => {
+                                app.messages.push("[SYSTEM] Failed to reconnect. Please restart.".to_string());
+                            }
+                        }
+                    }
                 }
-            };
+            } else {
+                match serde_json::from_str::<ServerMessage>(&text) {
+                    Ok(server_msg) => handle_server_message(app, server_msg),
+                    Err(_) => {
+                        // Raw info messages from the server
+                        app.messages.push(format!("[SERVER] {}", text));
+                    }
+                };
+            }
         }
 
         // Handle user input
         if event::poll(std::time::Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            let event = event::read()?;
+            match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // Global handler for Ctrl+Esc to show quit confirmation
                     if key.code == KeyCode::Esc && key.modifiers.contains(KeyModifiers::CONTROL) {
                         app.current_screen = CurrentScreen::QuitConfirmation;
@@ -178,6 +225,13 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                         CurrentScreen::QuitConfirmation => handle_quit_confirmation_screen(app, key),
                     }
                 }
+                Event::Mouse(mouse_event) => {
+                    // Handle mouse events (selection, scrolling, etc.)
+                    if app.current_screen == CurrentScreen::InRoom {
+                        handle_mouse_in_room(app, mouse_event);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -426,11 +480,10 @@ async fn handle_room_joining_screen(
 }
 
 async fn handle_in_room_screen(app: &mut App<'_>, key: event::KeyEvent) {
-    // Handle clipboard keybindings
+    // Handle clipboard keybindings (work in any mode)
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                // Ctrl+Shift+C: Copy text from input field
                 if let Some(clipboard) = &mut app.clipboard {
                     let text = app.message_input.lines().join("\n");
                     if !text.is_empty() {
@@ -443,28 +496,26 @@ async fn handle_in_room_screen(app: &mut App<'_>, key: event::KeyEvent) {
                 return;
             }
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                // Ctrl+Shift+V: Paste text
-                if let Some(clipboard) = &mut app.clipboard {
-                    match clipboard.paste_text() {
-                        Ok(text) => {
-                            // Insert text at cursor position
-                            for line in text.lines() {
-                                app.message_input.insert_str(line);
-                                app.message_input.insert_newline();
+                if app.vim_state.mode == VimMode::Insert {
+                    if let Some(clipboard) = &mut app.clipboard {
+                        match clipboard.paste_text() {
+                            Ok(text) => {
+                                for line in text.lines() {
+                                    app.message_input.insert_str(line);
+                                    app.message_input.insert_newline();
+                                }
+                                app.status_message = "Text pasted from clipboard".to_string();
                             }
-                            app.status_message = "Text pasted from clipboard".to_string();
+                            Err(e) => app.status_message = format!("Failed to paste: {}", e),
                         }
-                        Err(e) => app.status_message = format!("Failed to paste: {}", e),
                     }
                 }
                 return;
             }
             KeyCode::Char('v') => {
-                // Ctrl+V: Paste image (for future implementation)
                 if let Some(clipboard) = &mut app.clipboard {
                     if clipboard.has_image() {
                         app.status_message = "Image paste not yet implemented".to_string();
-                        // TODO: Implement image compression, encryption, and upload
                     } else {
                         app.status_message = "No image in clipboard".to_string();
                     }
@@ -474,54 +525,266 @@ async fn handle_in_room_screen(app: &mut App<'_>, key: event::KeyEvent) {
             _ => {}
         }
     }
-    
+
+    // Vim mode handling
+    match app.vim_state.mode {
+        VimMode::Normal => handle_normal_mode(app, key).await,
+        VimMode::Insert => handle_insert_mode(app, key).await,
+        VimMode::Visual => handle_visual_mode(app, key).await,
+    }
+}
+
+async fn handle_normal_mode(app: &mut App<'_>, key: event::KeyEvent) {
     match key.code {
-        KeyCode::Enter => {
-            let content = app.message_input.lines().join("\n");
-            if !content.is_empty() {
-                if let (Some(sender), Some(key), Some(room_id)) =
-                    (&app.ws_sender, &app.room_key, &app.room_id)
-                {
-                    match encrypt(key, content.as_bytes()) {
-                        Ok(ciphertext) => {
-                            let payload = SendMessagePayload {
-                                room_id,
-                                ciphertext: &ciphertext,
-                            };
-                            let msg = ClientMessage {
-                                message_type: "sendMessage",
-                                payload,
-                            };
-                            if let Ok(json) = serde_json::to_string(&msg) {
-                                if sender.send(json).is_ok() {
-                                    app.message_input = TextArea::default();
-                                    app.message_input
-                                        .set_placeholder_text("Type your encrypted message...");
-                                    app.message_input.set_block(
-                                        Block::default().borders(Borders::ALL).title("Message"),
-                                    );
-                                } else {
-                                    app.status_message =
-                                        "Connection lost. Restart to reconnect.".to_string();
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            app.status_message = "FATAL: Failed to encrypt message.".to_string();
-                        }
+        // Enter Insert mode
+        KeyCode::Char('i') => {
+            app.vim_state.enter_insert_mode();
+            app.status_message = "-- INSERT --".to_string();
+        }
+        KeyCode::Char('a') => {
+            app.vim_state.enter_insert_mode();
+            // Move cursor right by one (append after cursor)
+            app.message_input.move_cursor(tui_textarea::CursorMove::Forward);
+            app.status_message = "-- INSERT --".to_string();
+        }
+        KeyCode::Char('A') => {
+            app.vim_state.enter_insert_mode();
+            app.message_input.move_cursor(tui_textarea::CursorMove::End);
+            app.status_message = "-- INSERT --".to_string();
+        }
+        KeyCode::Char('I') => {
+            app.vim_state.enter_insert_mode();
+            app.message_input.move_cursor(tui_textarea::CursorMove::Head);
+            app.status_message = "-- INSERT --".to_string();
+        }
+        KeyCode::Char('o') => {
+            app.vim_state.enter_insert_mode();
+            app.message_input.move_cursor(tui_textarea::CursorMove::End);
+            app.message_input.insert_newline();
+            app.status_message = "-- INSERT --".to_string();
+        }
+        KeyCode::Char('O') => {
+            app.vim_state.enter_insert_mode();
+            app.message_input.move_cursor(tui_textarea::CursorMove::Head);
+            app.message_input.insert_newline();
+            app.message_input.move_cursor(tui_textarea::CursorMove::Up);
+            app.status_message = "-- INSERT --".to_string();
+        }
+        
+        // Enter Visual mode
+        KeyCode::Char('v') => {
+            app.vim_state.enter_visual_mode();
+            app.status_message = "-- VISUAL --".to_string();
+        }
+
+        // Navigation (hjkl)
+        KeyCode::Char('h') | KeyCode::Left => {
+            app.message_input.move_cursor(tui_textarea::CursorMove::Back);
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.message_input.move_cursor(tui_textarea::CursorMove::Down);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.message_input.move_cursor(tui_textarea::CursorMove::Up);
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            app.message_input.move_cursor(tui_textarea::CursorMove::Forward);
+        }
+
+        // Word movement
+        KeyCode::Char('w') => {
+            app.message_input.move_cursor(tui_textarea::CursorMove::WordForward);
+        }
+        KeyCode::Char('b') => {
+            app.message_input.move_cursor(tui_textarea::CursorMove::WordBack);
+        }
+
+        // Line movement
+        KeyCode::Char('0') => {
+            app.message_input.move_cursor(tui_textarea::CursorMove::Head);
+        }
+        KeyCode::Char('$') => {
+            app.message_input.move_cursor(tui_textarea::CursorMove::End);
+        }
+
+        // Document movement
+        KeyCode::Char('g') => {
+            if app.vim_state.pending_command == Some('g') {
+                // gg - go to top
+                app.message_input.move_cursor(tui_textarea::CursorMove::Top);
+                app.vim_state.reset();
+            } else {
+                app.vim_state.pending_command = Some('g');
+            }
+        }
+        KeyCode::Char('G') => {
+            app.message_input.move_cursor(tui_textarea::CursorMove::Bottom);
+        }
+
+        // Delete operations
+        KeyCode::Char('d') => {
+            if app.vim_state.pending_command == Some('d') {
+                // dd - delete line
+                app.message_input.delete_line_by_head();
+                app.vim_state.reset();
+            } else {
+                app.vim_state.pending_command = Some('d');
+            }
+        }
+        KeyCode::Char('x') => {
+            app.message_input.delete_next_char();
+        }
+
+        // Yank (copy)
+        KeyCode::Char('y') => {
+            if app.vim_state.pending_command == Some('y') {
+                // yy - yank line
+                if let Some(clipboard) = &mut app.clipboard {
+                    let (row, _) = app.message_input.cursor();
+                    if let Some(line) = app.message_input.lines().get(row) {
+                        let _ = clipboard.copy_text(line);
+                        app.status_message = "Line yanked".to_string();
+                    }
+                }
+                app.vim_state.reset();
+            } else {
+                app.vim_state.pending_command = Some('y');
+            }
+        }
+
+        // Paste
+        KeyCode::Char('p') => {
+            if let Some(clipboard) = &mut app.clipboard {
+                if let Ok(text) = clipboard.paste_text() {
+                    for line in text.lines() {
+                        app.message_input.insert_str(line);
                     }
                 }
             }
         }
+
+        // Undo/Redo
+        KeyCode::Char('u') => {
+            app.message_input.undo();
+        }
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.message_input.redo();
+        }
+
+        // Send message (Enter in Normal mode)
+        KeyCode::Enter => {
+            send_message(app).await;
+        }
+
+        // Command mode
+        KeyCode::Char(':') => {
+            // TODO: Implement command mode for :q, :q!, :w, etc.
+            app.status_message = "Command mode not yet implemented (use Ctrl+Esc to quit)".to_string();
+        }
+
+        _ => {
+            // Clear any pending commands
+            app.vim_state.reset();
+        }
+    }
+}
+
+async fn handle_insert_mode(app: &mut App<'_>, key: event::KeyEvent) {
+    match key.code {
         KeyCode::Esc => {
-            // Esc does nothing in chat (will be used for vim mode later)
-            // Use Ctrl+Esc to quit
+            // Exit Insert mode back to Normal mode
+            app.vim_state.enter_normal_mode();
+            app.status_message = "-- NORMAL --".to_string();
+        }
+        KeyCode::Enter => {
+            // In Insert mode, Enter sends the message
+            send_message(app).await;
         }
         _ => {
+            // Pass all other keys to the text input
             app.message_input.input(Event::Key(key));
         }
     }
 }
+
+async fn handle_visual_mode(app: &mut App<'_>, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('v') => {
+            // Exit Visual mode back to Normal mode
+            app.vim_state.enter_normal_mode();
+            app.status_message = "-- NORMAL --".to_string();
+        }
+        // Navigation works same as Normal mode
+        KeyCode::Char('h') | KeyCode::Left => {
+            app.message_input.move_cursor(tui_textarea::CursorMove::Back);
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.message_input.move_cursor(tui_textarea::CursorMove::Down);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.message_input.move_cursor(tui_textarea::CursorMove::Up);
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            app.message_input.move_cursor(tui_textarea::CursorMove::Forward);
+        }
+        // Yank selection
+        KeyCode::Char('y') => {
+            // TODO: Implement visual selection yank
+            app.status_message = "Visual yank not yet implemented".to_string();
+            app.vim_state.enter_normal_mode();
+        }
+        // Delete selection
+        KeyCode::Char('d') | KeyCode::Char('x') => {
+            // TODO: Implement visual selection delete
+            app.status_message = "Visual delete not yet implemented".to_string();
+            app.vim_state.enter_normal_mode();
+        }
+        _ => {}
+    }
+}
+
+async fn send_message(app: &mut App<'_>) {
+    let content = app.message_input.lines().join("\n");
+    if !content.is_empty() {
+        if let (Some(sender), Some(key), Some(room_id)) =
+            (&app.ws_sender, &app.room_key, &app.room_id)
+        {
+            match encrypt(key, content.as_bytes()) {
+                Ok(ciphertext) => {
+                    let payload = SendMessagePayload {
+                        room_id,
+                        ciphertext: &ciphertext,
+                    };
+                    let msg = ClientMessage {
+                        message_type: "sendMessage",
+                        payload,
+                    };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if sender.send(json).is_ok() {
+                            app.message_input = TextArea::default();
+                            app.message_input.set_placeholder_text("Type your encrypted message...");
+                            app.message_input.set_block(
+                                Block::default().borders(Borders::ALL).title("Message"),
+                            );
+                            // Stay in current vim mode after sending
+                            if app.vim_state.mode == VimMode::Normal {
+                                app.status_message = "-- NORMAL --".to_string();
+                            } else {
+                                app.status_message = "-- INSERT --".to_string();
+                            }
+                        } else {
+                            app.status_message = "Connection lost. Restart to reconnect.".to_string();
+                        }
+                    }
+                }
+                Err(_) => {
+                    app.status_message = "FATAL: Failed to encrypt message.".to_string();
+                }
+            }
+        }
+    }
+}
+
 
 fn handle_quit_confirmation_screen(app: &mut App<'_>, key: event::KeyEvent) {
     match key.code {
@@ -535,6 +798,29 @@ fn handle_quit_confirmation_screen(app: &mut App<'_>, key: event::KeyEvent) {
             } else {
                 app.current_screen = CurrentScreen::RoomChoice;
             }
+        }
+        _ => {}
+    }
+}
+
+fn handle_mouse_in_room(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollDown => {
+            // Scroll messages down
+            if app.message_scroll_offset > 0 {
+                app.message_scroll_offset = app.message_scroll_offset.saturating_sub(1);
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            // Scroll messages up
+            let max_scroll = app.messages.len().saturating_sub(10);
+            if app.message_scroll_offset < max_scroll {
+                app.message_scroll_offset += 1;
+            }
+        }
+        MouseEventKind::Down(_button) => {
+            // Mouse click - could be used for text selection in the future
+            // For now, just auto-copy selected text if supported by terminal
         }
         _ => {}
     }
@@ -644,6 +930,42 @@ async fn establish_connection(
     app: &mut App<'_>,
     ws_incoming_tx: mpsc::UnboundedSender<String>,
 ) -> Result<(), Box<dyn Error>> {
+    // Try to connect with exponential backoff
+    let max_attempts = 5;
+    let mut delay_ms = 1000;
+    
+    for attempt in 0..max_attempts {
+        app.reconnect_attempts = attempt;
+        app.is_reconnecting = attempt > 0;
+        
+        if attempt > 0 {
+            app.status_message = format!("Reconnecting... attempt {}/{}", attempt + 1, max_attempts);
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            delay_ms = (delay_ms * 2).min(30000); // Max 30 seconds
+        }
+        
+        match try_connect(app, ws_incoming_tx.clone()).await {
+            Ok(_) => {
+                app.reconnect_attempts = 0;
+                app.is_reconnecting = false;
+                app.status_message = "Connected".to_string();
+                return Ok(());
+            }
+            Err(e) if attempt == max_attempts - 1 => {
+                app.status_message = format!("Connection failed: {}", e);
+                return Err(e);
+            }
+            Err(_) => continue,
+        }
+    }
+    
+    Err("Failed to connect after multiple attempts".into())
+}
+
+async fn try_connect(
+    app: &mut App<'_>,
+    ws_incoming_tx: mpsc::UnboundedSender<String>,
+) -> Result<(), Box<dyn Error>> {
     let ws_url = &app.config.server.url;
     let (ws_stream, _) = connect_async(ws_url).await?;
     let (mut write, mut read) = ws_stream.split();
@@ -653,18 +975,19 @@ async fn establish_connection(
     app.ws_sender = Some(ws_outgoing_tx);
 
     // Task to listen for incoming messages from the server
+    let incoming_tx = ws_incoming_tx.clone();
     tokio::spawn(async move {
         while let Some(message_result) = read.next().await {
             match message_result {
                 Ok(msg) => {
                     if let Message::Text(text) = msg {
-                        if ws_incoming_tx.send(text).is_err() {
+                        if incoming_tx.send(text).is_err() {
                             break;
                         }
                     }
                 }
                 Err(_) => {
-                    let _ = ws_incoming_tx.send("Connection to server lost.".to_string());
+                    let _ = incoming_tx.send("__DISCONNECT__".to_string());
                     break;
                 }
             }
@@ -1014,6 +1337,19 @@ fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
     ));
     f.render_widget(messages_list, chunks[0]);
 
+    // Update message input block to show vim mode
+    let vim_mode_str = app.vim_state.mode.as_str();
+    let title = format!("Message [{}]", vim_mode_str);
+    app.message_input.set_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(match app.vim_state.mode {
+                VimMode::Normal => Style::default().fg(Color::Cyan),
+                VimMode::Insert => Style::default().fg(Color::Green),
+                VimMode::Visual => Style::default().fg(Color::Yellow),
+            })
+    );
     f.render_widget(&app.message_input, chunks[1]);
 }
 
