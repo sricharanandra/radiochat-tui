@@ -926,6 +926,27 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
     }
 }
 
+fn load_auth_token(token_path: &str) -> Option<String> {
+    use std::fs;
+    use std::path::Path;
+    
+    // Expand ~ to home directory
+    let expanded_path = if token_path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            home.join(&token_path[2..])
+        } else {
+            return None;
+        }
+    } else {
+        Path::new(token_path).to_path_buf()
+    };
+    
+    // Read token file
+    fs::read_to_string(expanded_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
 async fn establish_connection(
     app: &mut App<'_>,
     ws_incoming_tx: mpsc::UnboundedSender<String>,
@@ -966,8 +987,16 @@ async fn try_connect(
     app: &mut App<'_>,
     ws_incoming_tx: mpsc::UnboundedSender<String>,
 ) -> Result<(), Box<dyn Error>> {
-    let ws_url = &app.config.server.url;
-    let (ws_stream, _) = connect_async(ws_url).await?;
+    let mut ws_url = app.config.server.url.clone();
+    
+    // Try to load token and append to URL
+    if let Some(token) = load_auth_token(&app.config.auth.token_path) {
+        // Append token as query parameter
+        let separator = if ws_url.contains('?') { '&' } else { '?' };
+        ws_url = format!("{}{}token={}", ws_url, separator, token);
+    }
+    
+    let (ws_stream, _) = connect_async(&ws_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
     // Create a channel for sending messages to the WebSocket task
