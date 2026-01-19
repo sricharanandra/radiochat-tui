@@ -465,6 +465,9 @@ async fn handle_room_choice_screen(app: &mut App<'_>, key: event::KeyEvent) {
                 }
             }
         }
+        KeyCode::Char(':') => {
+            app.command_input = Some(String::new());
+        }
         _ => {}
     }
 }
@@ -1326,6 +1329,7 @@ async fn register_user(server_url: &str, username: &str, public_key: &str) -> Re
     struct RegisterResponse {
         #[serde(rename = "userId")]
         _user_id: String,
+        #[serde(rename = "username")]
         _username: String,
         token: String,
     }
