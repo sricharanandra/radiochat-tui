@@ -31,11 +31,12 @@ use tui_textarea::TextArea;
 enum CurrentScreen {
     RoomChoice,
     RoomList,
-    RoomTypeSelection,  // NEW: Select public/private
+    RoomTypeSelection,
     RoomCreation,
     CreateRoomInput,
     RoomJoining,
     InRoom,
+    RoomSwitcher,  // Floating overlay to switch rooms
     QuitConfirmation,
 }
 
@@ -72,6 +73,10 @@ struct App<'a> {
     
     // Room Creation
     selected_room_type: bool,  // false = public, true = private
+    
+    // Room Switcher
+    user_rooms: Vec<RoomInfo>,  // Rooms user is a member of
+    switcher_selected_index: usize,
 
     // WebSocket
     ws_sender: Option<mpsc::UnboundedSender<String>>,
@@ -122,6 +127,8 @@ impl<'a> Default for App<'a> {
             selected_room_index: 0,
             viewing_private: false,
             selected_room_type: false,  // false = public, true = private
+            user_rooms: Vec::new(),
+            switcher_selected_index: 0,
             ws_sender: None,
             reconnect_attempts: 0,
             is_reconnecting: false,
@@ -266,6 +273,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                             handle_room_joining_screen(app, key, ws_incoming_tx.clone()).await
                         }
                         CurrentScreen::InRoom => handle_in_room_screen(app, key).await,
+                        CurrentScreen::RoomSwitcher => handle_room_switcher_screen(app, key).await,
                         CurrentScreen::QuitConfirmation => handle_quit_confirmation_screen(app, key),
                     }
                 }
@@ -850,6 +858,51 @@ fn handle_quit_confirmation_screen(app: &mut App<'_>, key: event::KeyEvent) {
     }
 }
 
+async fn handle_room_switcher_screen(app: &mut App<'_>, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            // Close switcher, return to room
+            app.current_screen = CurrentScreen::InRoom;
+            app.status_message = "-- NORMAL --".to_string();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.switcher_selected_index > 0 {
+                app.switcher_selected_index -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.switcher_selected_index + 1 < app.user_rooms.len() {
+                app.switcher_selected_index += 1;
+            }
+        }
+        KeyCode::Enter => {
+            // Switch to selected room
+            if let Some(room) = app.user_rooms.get(app.switcher_selected_index) {
+                let room_name = room.name.clone();
+                
+                // Join the new room
+                if let Some(ws_sender) = &app.ws_sender {
+                    let join_payload = JoinRoomPayload {
+                        room_id: None,
+                        room_name: Some(&room_name),
+                    };
+                    let join_message = ClientMessage {
+                        message_type: "joinRoom",
+                        payload: join_payload,
+                    };
+                    if let Ok(json) = serde_json::to_string(&join_message) {
+                        let _ = ws_sender.send(json);
+                    }
+                }
+                app.messages.clear();
+                app.current_screen = CurrentScreen::InRoom;
+                app.status_message = format!("Switching to #{}", room_name);
+            }
+        }
+        _ => {}
+    }
+}
+
 // --- Command Mode ---
 
 async fn execute_command(app: &mut App<'_>, cmd: &str) {
@@ -879,6 +932,67 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
         // Help command
         "h" | "help" => {
             app.status_message = "Commands: :q (quit/leave) :help :register :list :switch <room>".to_string();
+        }
+        // List rooms (room switcher)
+        "l" | "list" => {
+            if app.current_screen == CurrentScreen::InRoom {
+                // Request room list from server
+                if let Some(ws_sender) = &app.ws_sender {
+                    let list_message = ClientMessage {
+                        message_type: "listRooms",
+                        payload: ListRoomsPayload {},
+                    };
+                    if let Ok(json) = serde_json::to_string(&list_message) {
+                        let _ = ws_sender.send(json);
+                    }
+                }
+                // Populate user_rooms from public + private rooms
+                app.user_rooms.clear();
+                app.user_rooms.extend(app.public_rooms.iter().cloned());
+                app.user_rooms.extend(app.private_rooms.iter().cloned());
+                app.switcher_selected_index = 0;
+                app.current_screen = CurrentScreen::RoomSwitcher;
+                app.status_message = "Select room to switch".to_string();
+            } else {
+                app.status_message = ":list only works inside a room".to_string();
+            }
+        }
+        // Switch to room by name
+        "s" | "switch" => {
+            if let Some(room_name) = parts.get(1) {
+                if app.current_screen == CurrentScreen::InRoom {
+                    // Find room and switch
+                    let target_room = app.public_rooms.iter()
+                        .chain(app.private_rooms.iter())
+                        .find(|r| r.name == *room_name || r.display_name == *room_name)
+                        .cloned();
+                    
+                    if let Some(room) = target_room {
+                        // Join the new room
+                        if let Some(ws_sender) = &app.ws_sender {
+                            let join_payload = JoinRoomPayload {
+                                room_id: None,
+                                room_name: Some(&room.name),
+                            };
+                            let join_message = ClientMessage {
+                                message_type: "joinRoom",
+                                payload: join_payload,
+                            };
+                            if let Ok(json) = serde_json::to_string(&join_message) {
+                                let _ = ws_sender.send(json);
+                            }
+                        }
+                        app.messages.clear();
+                        app.status_message = format!("Switching to #{}", room.name);
+                    } else {
+                        app.status_message = format!("Room '{}' not found", room_name);
+                    }
+                } else {
+                    app.status_message = ":switch only works inside a room".to_string();
+                }
+            } else {
+                app.status_message = "Usage: :switch <room-name>".to_string();
+            }
         }
         // Unknown command
         "" => {
@@ -1354,6 +1468,11 @@ fn ui(f: &mut Frame, app: &mut App) {
         CurrentScreen::RoomCreation => render_room_creation(f, app, chunks[1]),
         CurrentScreen::RoomJoining => render_room_joining(f, app, chunks[1]),
         CurrentScreen::InRoom => render_in_room(f, app, chunks[1]),
+        CurrentScreen::RoomSwitcher => {
+            // Render room in background, then overlay
+            render_in_room(f, app, chunks[1]);
+            render_room_switcher_overlay(f, app, chunks[1]);
+        }
         CurrentScreen::QuitConfirmation => render_quit_confirmation(f, chunks[1]),
     }
 
@@ -1562,6 +1681,52 @@ fn render_quit_confirmation(f: &mut Frame, area: Rect) {
     // Clear the background
     f.render_widget(Clear, dialog_area);
     f.render_widget(widget, dialog_area);
+}
+
+fn render_room_switcher_overlay(f: &mut Frame, app: &App, area: Rect) {
+    // Calculate centered overlay area (50% width, 60% height)
+    let overlay_width = area.width / 2;
+    let overlay_height = (area.height * 3) / 5;
+    let overlay_x = area.x + (area.width - overlay_width) / 2;
+    let overlay_y = area.y + (area.height - overlay_height) / 2;
+    
+    let overlay_area = Rect {
+        x: overlay_x,
+        y: overlay_y,
+        width: overlay_width,
+        height: overlay_height,
+    };
+    
+    // Create list items from user's rooms
+    let items: Vec<ListItem> = app.user_rooms
+        .iter()
+        .enumerate()
+        .map(|(i, room)| {
+            let is_current = app.room_name.as_ref() == Some(&room.name);
+            let marker = if is_current { "* " } else { "  " };
+            let content = format!("{}#{}", marker, room.display_name);
+            
+            let style = if i == app.switcher_selected_index {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else if is_current {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default()
+            };
+            
+            ListItem::new(content).style(style)
+        })
+        .collect();
+    
+    let list = List::new(items)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("Your Rooms - [Enter] Switch [Esc] Cancel")
+            .border_style(Style::default().fg(Color::Cyan)));
+    
+    // Clear background and render overlay
+    f.render_widget(Clear, overlay_area);
+    f.render_widget(list, overlay_area);
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
