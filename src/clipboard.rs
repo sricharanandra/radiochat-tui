@@ -34,6 +34,7 @@ impl ClipboardManager {
     }
     
     /// Paste image from clipboard as PNG bytes
+    #[allow(dead_code)]
     pub fn paste_image(&mut self) -> Result<Vec<u8>, String> {
         let img = self.clipboard
             .get_image()
@@ -68,6 +69,7 @@ impl ClipboardManager {
     }
     
     /// Copy image to clipboard from PNG bytes
+    #[allow(dead_code)]
     pub fn copy_image(&mut self, png_bytes: &[u8]) -> Result<(), String> {
         // Decode PNG
         let img = image::load_from_memory_with_format(png_bytes, ImageFormat::Png)

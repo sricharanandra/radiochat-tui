@@ -47,9 +47,11 @@ pub struct ClientMessage<'a, T> {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct MessagePayload {
+    #[allow(dead_code)]
     pub id: String,
     pub username: String,
     pub ciphertext: String,
+    #[allow(dead_code)]
     pub timestamp: String,
 }
 
@@ -57,6 +59,7 @@ pub struct MessagePayload {
 pub struct UserJoinedPayload {
     pub username: String,
     #[serde(rename = "userId")]
+    #[allow(dead_code)]
     pub user_id: String,
 }
 
@@ -64,6 +67,7 @@ pub struct UserJoinedPayload {
 pub struct UserLeftPayload {
     pub username: String,
     #[serde(rename = "userId")]
+    #[allow(dead_code)]
     pub user_id: String,
 }
 
@@ -76,6 +80,7 @@ pub struct RoomJoinedPayload {
     #[serde(rename = "displayName")]
     pub display_name: String,
     #[serde(rename = "roomType")]
+    #[allow(dead_code)]
     pub room_type: String,
     #[serde(rename = "encryptedKey")]
     pub encrypted_key: String,
@@ -91,6 +96,7 @@ pub struct RoomCreatedPayload {
     #[serde(rename = "displayName")]
     pub display_name: String,
     #[serde(rename = "roomType")]
+    #[allow(dead_code)]
     pub room_type: String,
     #[serde(rename = "encryptedKey")]
     pub encrypted_key: String,
@@ -99,15 +105,18 @@ pub struct RoomCreatedPayload {
 #[derive(Deserialize, Debug, Clone)]
 pub struct RoomInfo {
     #[serde(rename = "roomId")]
+    #[allow(dead_code)]
     pub room_id: String,
     pub name: String,
     #[serde(rename = "displayName")]
     pub display_name: String,
     #[serde(rename = "roomType")]
+    #[allow(dead_code)]
     pub room_type: String,
     #[serde(rename = "memberCount")]
     pub member_count: usize,
     #[serde(rename = "isJoined")]
+    #[allow(dead_code)]
     pub is_joined: bool,
 }
 

@@ -8,6 +8,7 @@ use rand::RngCore;
 pub type AesKey = aes_gcm::Key<Aes256Gcm>;
 
 /// Generates a new, random 32-byte key for AES-256-GCM encryption.
+#[allow(dead_code)]
 pub fn generate_key() -> AesKey {
     Aes256Gcm::generate_key(OsRng)
 }
