@@ -533,7 +533,6 @@ async fn handle_in_room_screen(app: &mut App<'_>, key: event::KeyEvent) {
     match app.vim_state.mode {
         VimMode::Normal => handle_normal_mode(app, key).await,
         VimMode::Insert => handle_insert_mode(app, key).await,
-        VimMode::Visual => handle_visual_mode(app, key).await,
     }
 }
 
@@ -572,12 +571,6 @@ async fn handle_normal_mode(app: &mut App<'_>, key: event::KeyEvent) {
             app.message_input.insert_newline();
             app.message_input.move_cursor(tui_textarea::CursorMove::Up);
             app.status_message = "-- INSERT --".to_string();
-        }
-        
-        // Enter Visual mode
-        KeyCode::Char('v') => {
-            app.vim_state.enter_visual_mode();
-            app.status_message = "-- VISUAL --".to_string();
         }
 
         // Navigation (hjkl)
@@ -707,42 +700,6 @@ async fn handle_insert_mode(app: &mut App<'_>, key: event::KeyEvent) {
             // Pass all other keys to the text input
             app.message_input.input(Event::Key(key));
         }
-    }
-}
-
-async fn handle_visual_mode(app: &mut App<'_>, key: event::KeyEvent) {
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('v') => {
-            // Exit Visual mode back to Normal mode
-            app.vim_state.enter_normal_mode();
-            app.status_message = "-- NORMAL --".to_string();
-        }
-        // Navigation works same as Normal mode
-        KeyCode::Char('h') | KeyCode::Left => {
-            app.message_input.move_cursor(tui_textarea::CursorMove::Back);
-        }
-        KeyCode::Char('j') | KeyCode::Down => {
-            app.message_input.move_cursor(tui_textarea::CursorMove::Down);
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            app.message_input.move_cursor(tui_textarea::CursorMove::Up);
-        }
-        KeyCode::Char('l') | KeyCode::Right => {
-            app.message_input.move_cursor(tui_textarea::CursorMove::Forward);
-        }
-        // Yank selection
-        KeyCode::Char('y') => {
-            // TODO: Implement visual selection yank
-            app.status_message = "Visual yank not yet implemented".to_string();
-            app.vim_state.enter_normal_mode();
-        }
-        // Delete selection
-        KeyCode::Char('d') | KeyCode::Char('x') => {
-            // TODO: Implement visual selection delete
-            app.status_message = "Visual delete not yet implemented".to_string();
-            app.vim_state.enter_normal_mode();
-        }
-        _ => {}
     }
 }
 
@@ -1407,7 +1364,6 @@ fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
             .border_style(match app.vim_state.mode {
                 VimMode::Normal => Style::default().fg(Color::Cyan),
                 VimMode::Insert => Style::default().fg(Color::Green),
-                VimMode::Visual => Style::default().fg(Color::Yellow),
             })
     );
     f.render_widget(&app.message_input, chunks[1]);

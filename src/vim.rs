@@ -1,11 +1,10 @@
 /// Vim mode system for RadioChat TUI
-/// Provides Normal, Insert, and Visual modes with standard vim keybindings
+/// Provides Normal and Insert modes with standard vim keybindings
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VimMode {
     Normal,
     Insert,
-    Visual,
 }
 
 impl VimMode {
@@ -13,7 +12,6 @@ impl VimMode {
         match self {
             VimMode::Normal => "-- NORMAL --",
             VimMode::Insert => "-- INSERT --",
-            VimMode::Visual => "-- VISUAL --",
         }
     }
 }
@@ -48,11 +46,6 @@ impl VimState {
 
     pub fn enter_normal_mode(&mut self) {
         self.mode = VimMode::Normal;
-        self.reset();
-    }
-
-    pub fn enter_visual_mode(&mut self) {
-        self.mode = VimMode::Visual;
         self.reset();
     }
 }
