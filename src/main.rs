@@ -44,7 +44,6 @@ enum CurrentScreen {
     InRoom,
     RoomSwitcher,
     Help,
-    QuitConfirmation,
 }
 
 enum CurrentlyEditing {
@@ -265,15 +264,6 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
             let event = event::read()?;
             match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    // Global handler for Ctrl+Esc or Ctrl+C to show quit confirmation
-                    if (key.code == KeyCode::Esc && key.modifiers.contains(KeyModifiers::CONTROL))
-                        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-                    {
-                        app.command_input = None; // Cancel command mode if active
-                        app.current_screen = CurrentScreen::QuitConfirmation;
-                        continue;
-                    }
-                    
                     // Handle command mode input
                     if app.command_input.is_some() {
                         match key.code {
@@ -324,7 +314,6 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                         CurrentScreen::InRoom => handle_in_room_screen(app, key).await,
                         CurrentScreen::RoomSwitcher => handle_room_switcher_screen(app, key).await,
                         CurrentScreen::Help => handle_help_screen(app, key),
-                        CurrentScreen::QuitConfirmation => handle_quit_confirmation_screen(app, key),
                     }
                 }
                 Event::Mouse(mouse_event) => {
@@ -925,24 +914,6 @@ async fn send_message(app: &mut App<'_>) {
     }
 }
 
-
-fn handle_quit_confirmation_screen(app: &mut App<'_>, key: event::KeyEvent) {
-    match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.should_quit = true;
-        }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            // Return to the previous screen (InRoom if in a room, otherwise RoomChoice)
-            if app.room_id.is_some() {
-                app.current_screen = CurrentScreen::InRoom;
-            } else {
-                app.current_screen = CurrentScreen::RoomChoice;
-            }
-        }
-        _ => {}
-    }
-}
-
 async fn handle_room_switcher_screen(app: &mut App<'_>, key: event::KeyEvent) {
     match key.code {
         KeyCode::Esc => {
@@ -1026,7 +997,7 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                 }
                 _ => {
                     // Quit application
-                    app.current_screen = CurrentScreen::QuitConfirmation;
+                    app.should_quit = true;
                 }
             }
         }
@@ -1542,7 +1513,6 @@ fn ui(f: &mut Frame, app: &mut App) {
             render_room_switcher_overlay(f, app, chunks[1]);
         }
         CurrentScreen::Help => render_help(f, chunks[1]),
-        CurrentScreen::QuitConfirmation => render_quit_confirmation(f, chunks[1]),
     }
 
     render_footer(f, app, chunks[2]);
@@ -1699,33 +1669,6 @@ fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
             })
     );
     f.render_widget(&app.message_input, chunks[1]);
-}
-
-fn render_quit_confirmation(f: &mut Frame, area: Rect) {
-    // Center the dialog
-    let dialog_area = centered_rect(60, 30, area);
-    
-    let text = Text::from(vec![
-        Line::from(""),
-        Line::from(""),
-        Line::from("Are you sure you want to quit?").alignment(Alignment::Center),
-        Line::from(""),
-        Line::from("Press 'y' to quit").alignment(Alignment::Center),
-        Line::from("Press 'n' or Esc to cancel").alignment(Alignment::Center),
-    ]);
-    
-    let widget = Paragraph::new(text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Quit Confirmation")
-                .border_style(Style::default().fg(Color::Red))
-        )
-        .alignment(Alignment::Center);
-    
-    // Clear the background
-    f.render_widget(Clear, dialog_area);
-    f.render_widget(widget, dialog_area);
 }
 
 fn render_room_switcher_overlay(f: &mut Frame, app: &App, area: Rect) {
@@ -1985,26 +1928,5 @@ fn restore_terminal(
     )?;
     terminal.show_cursor()?;
     Ok(())
-}
-
-/// Helper function to create a centered rectangle for dialogs
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
 }
 
