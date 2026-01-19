@@ -29,6 +29,13 @@ use tui_textarea::TextArea;
 
 #[derive(PartialEq)]
 enum CurrentScreen {
+    // Registration flow
+    Registration,         // No SSH keys found error
+    KeySelection,         // Select SSH key from list
+    UsernameInput,        // Enter username
+    RegistrationSuccess,  // Show token + success
+    
+    // Main flow
     RoomChoice,
     RoomList,
     RoomTypeSelection,
@@ -36,7 +43,7 @@ enum CurrentScreen {
     CreateRoomInput,
     RoomJoining,
     InRoom,
-    RoomSwitcher,  // Floating overlay to switch rooms
+    RoomSwitcher,
     QuitConfirmation,
 }
 
@@ -89,6 +96,13 @@ struct App<'a> {
     
     // Command Mode
     command_input: Option<String>,
+    
+    // Registration
+    available_keys: Vec<(String, String)>,  // (path, content)
+    selected_key_index: usize,
+    username_input: TextArea<'a>,
+    registration_token: Option<String>,
+    registration_error: Option<String>,
 }
 
 impl<'a> Default for App<'a> {
@@ -137,6 +151,16 @@ impl<'a> Default for App<'a> {
             vim_state: VimState::default(),
             message_scroll_offset: 0,
             command_input: None,
+            available_keys: Vec::new(),
+            selected_key_index: 0,
+            username_input: {
+                let mut input = TextArea::default();
+                input.set_placeholder_text("Enter your username...");
+                input.set_block(Block::default().borders(Borders::ALL).title("Username"));
+                input
+            },
+            registration_token: None,
+            registration_error: None,
         }
     }
 }
@@ -155,11 +179,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
 async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> io::Result<()> {
     let (ws_incoming_tx, mut ws_incoming_rx) = mpsc::unbounded_channel::<String>();
 
-    // Establish WebSocket connection at startup
-    if let Ok(()) = establish_connection(app, ws_incoming_tx.clone()).await {
-        app.status_message = "Connected! Create or Join a secure room.".to_string();
+    // Check if user is registered (has auth token)
+    let token_exists = load_auth_token(&app.config.auth.token_path).is_some();
+    
+    if !token_exists {
+        // No token found - need to register
+        app.available_keys = scan_ssh_keys();
+        if app.available_keys.is_empty() {
+            app.current_screen = CurrentScreen::Registration;
+            app.status_message = "No SSH keys found. Create one to register.".to_string();
+        } else {
+            app.current_screen = CurrentScreen::KeySelection;
+            app.selected_key_index = 0;
+            app.status_message = "Welcome! Select an SSH key to register.".to_string();
+        }
     } else {
-        app.status_message = "Failed to connect to server. Check if server is running.".to_string();
+        // Token exists - establish WebSocket connection
+        if let Ok(()) = establish_connection(app, ws_incoming_tx.clone()).await {
+            app.status_message = "Connected! Create or Join a secure room.".to_string();
+        } else {
+            app.status_message = "Failed to connect to server. Check if server is running.".to_string();
+        }
     }
 
     loop {
@@ -167,6 +207,18 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
 
         if app.should_quit {
             break;
+        }
+
+        // Establish connection after registration completes
+        if app.current_screen == CurrentScreen::RoomChoice 
+            && app.ws_sender.is_none() 
+            && load_auth_token(&app.config.auth.token_path).is_some() 
+        {
+            if let Ok(()) = establish_connection(app, ws_incoming_tx.clone()).await {
+                app.status_message = "Connected! Create or Join a secure room.".to_string();
+            } else {
+                app.status_message = "Failed to connect to server.".to_string();
+            }
         }
 
         // Handle incoming WebSocket messages without blocking UI
@@ -260,6 +312,13 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                     }
                     
                     match app.current_screen {
+                        // Registration screens
+                        CurrentScreen::Registration => handle_registration_screen(app, key).await,
+                        CurrentScreen::KeySelection => handle_key_selection_screen(app, key).await,
+                        CurrentScreen::UsernameInput => handle_username_input_screen(app, key).await,
+                        CurrentScreen::RegistrationSuccess => handle_registration_success_screen(app, key).await,
+                        
+                        // Main screens
                         CurrentScreen::RoomChoice => handle_room_choice_screen(app, key).await,
                         CurrentScreen::RoomList => handle_room_list_screen(app, key, ws_incoming_tx.clone()).await,
                         CurrentScreen::RoomTypeSelection => handle_room_type_selection_screen(app, key).await,
@@ -291,6 +350,107 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
 }
 
 // --- Screen & Input Handlers ---
+
+// Registration screen handlers
+
+async fn handle_registration_screen(app: &mut App<'_>, key: event::KeyEvent) {
+    // This screen shows when no SSH keys are found
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+            app.should_quit = true;
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            // Retry scanning for keys
+            app.available_keys = scan_ssh_keys();
+            if !app.available_keys.is_empty() {
+                app.current_screen = CurrentScreen::KeySelection;
+                app.selected_key_index = 0;
+                app.status_message = "Select SSH key to use for registration".to_string();
+            } else {
+                app.status_message = "Still no SSH keys found. Create one first.".to_string();
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn handle_key_selection_screen(app: &mut App<'_>, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.selected_key_index > 0 {
+                app.selected_key_index -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.selected_key_index + 1 < app.available_keys.len() {
+                app.selected_key_index += 1;
+            }
+        }
+        KeyCode::Enter => {
+            // Proceed to username input
+            app.current_screen = CurrentScreen::UsernameInput;
+            app.status_message = "Enter your desired username".to_string();
+        }
+        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+            app.should_quit = true;
+        }
+        _ => {}
+    }
+}
+
+async fn handle_username_input_screen(app: &mut App<'_>, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Enter => {
+            let username = app.username_input.lines().join("").trim().to_string();
+            if username.is_empty() {
+                app.status_message = "Username cannot be empty".to_string();
+                return;
+            }
+            
+            // Get selected key
+            if let Some((_, public_key)) = app.available_keys.get(app.selected_key_index) {
+                let public_key = public_key.clone();
+                
+                // Perform registration
+                app.status_message = "Registering...".to_string();
+                
+                match register_user(&app.config.server.url, &username, &public_key).await {
+                    Ok(token) => {
+                        // Save token
+                        if let Err(e) = save_auth_token(&token) {
+                            app.registration_error = Some(format!("Failed to save token: {}", e));
+                        }
+                        app.registration_token = Some(token);
+                        app.current_screen = CurrentScreen::RegistrationSuccess;
+                        app.status_message = "Registration successful!".to_string();
+                    }
+                    Err(e) => {
+                        app.registration_error = Some(e.to_string());
+                        app.status_message = format!("Registration failed: {}", e);
+                    }
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.current_screen = CurrentScreen::KeySelection;
+            app.status_message = "Select SSH key to use for registration".to_string();
+        }
+        _ => {
+            app.username_input.input(Event::Key(key));
+        }
+    }
+}
+
+async fn handle_registration_success_screen(app: &mut App<'_>, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Enter => {
+            // Continue to main app
+            app.current_screen = CurrentScreen::RoomChoice;
+            app.status_message = "Create or Join a secure room.".to_string();
+        }
+        _ => {}
+    }
+}
 
 async fn handle_room_choice_screen(app: &mut App<'_>, key: event::KeyEvent) {
     match key.code {
@@ -994,6 +1154,18 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                 app.status_message = "Usage: :switch <room-name>".to_string();
             }
         }
+        // Register command
+        "register" | "reg" => {
+            app.available_keys = scan_ssh_keys();
+            if app.available_keys.is_empty() {
+                app.current_screen = CurrentScreen::Registration;
+                app.status_message = "No SSH keys found".to_string();
+            } else {
+                app.current_screen = CurrentScreen::KeySelection;
+                app.selected_key_index = 0;
+                app.status_message = "Select SSH key to use for registration".to_string();
+            }
+        }
         // Unknown command
         "" => {
             // Empty command, do nothing
@@ -1146,6 +1318,144 @@ fn load_auth_token(token_path: &str) -> Option<String> {
     fs::read_to_string(expanded_path)
         .ok()
         .map(|s| s.trim().to_string())
+}
+
+fn scan_ssh_keys() -> Vec<(String, String)> {
+    use std::fs;
+    
+    let ssh_dir = dirs::home_dir()
+        .map(|h| h.join(".ssh"))
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.ssh"));
+    
+    let mut keys = Vec::new();
+    
+    if let Ok(entries) = fs::read_dir(&ssh_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension() {
+                if ext == "pub" {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        let content = content.trim().to_string();
+                        if content.starts_with("ssh-ed25519") || content.starts_with("ssh-rsa") {
+                            let path_str = path.to_string_lossy().to_string();
+                            keys.push((path_str, content));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Sort: ed25519 keys first, then alphabetically
+    keys.sort_by(|a, b| {
+        let a_is_ed25519 = a.1.starts_with("ssh-ed25519");
+        let b_is_ed25519 = b.1.starts_with("ssh-ed25519");
+        
+        match (a_is_ed25519, b_is_ed25519) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.0.cmp(&b.0),
+        }
+    });
+    
+    keys
+}
+
+fn detect_key_type(public_key: &str) -> Option<&'static str> {
+    if public_key.starts_with("ssh-ed25519") {
+        Some("ed25519")
+    } else if public_key.starts_with("ssh-rsa") {
+        Some("rsa")
+    } else {
+        None
+    }
+}
+
+async fn register_user(server_url: &str, username: &str, public_key: &str) -> Result<String, Box<dyn Error>> {
+    use serde::{Deserialize, Serialize};
+    
+    #[derive(Serialize)]
+    struct RegisterRequest {
+        username: String,
+        #[serde(rename = "publicKey")]
+        public_key: String,
+        #[serde(rename = "keyType")]
+        key_type: String,
+    }
+    
+    #[derive(Deserialize)]
+    struct RegisterResponse {
+        #[serde(rename = "userId")]
+        _user_id: String,
+        _username: String,
+        token: String,
+    }
+    
+    #[derive(Deserialize)]
+    struct ErrorResponse {
+        error: String,
+    }
+    
+    let key_type = detect_key_type(public_key)
+        .ok_or("Invalid SSH key type")?
+        .to_string();
+    
+    let request = RegisterRequest {
+        username: username.to_string(),
+        public_key: public_key.to_string(),
+        key_type,
+    };
+    
+    // Convert WebSocket URL to HTTP URL for API call
+    let api_url = server_url
+        .replace("wss://", "https://")
+        .replace("ws://", "http://")
+        .replace("/ws", "");
+    
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/api/auth/register", api_url))
+        .json(&request)
+        .send()
+        .await?;
+    
+    if !response.status().is_success() {
+        let error: ErrorResponse = response.json().await.unwrap_or(ErrorResponse {
+            error: "Unknown error".to_string(),
+        });
+        return Err(error.error.into());
+    }
+    
+    let result: RegisterResponse = response.json().await?;
+    Ok(result.token)
+}
+
+fn save_auth_token(token: &str) -> Result<(), Box<dyn Error>> {
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    
+    // Get config directory
+    let config_dir = dirs::config_dir()
+        .ok_or("Config directory not found")?
+        .join("radiochat");
+    
+    // Create directory if it doesn't exist
+    fs::create_dir_all(&config_dir)?;
+    
+    // Write token file
+    let token_path = config_dir.join("token");
+    fs::write(&token_path, token)?;
+    
+    // Set permissions to 0600 (owner read/write only) on Unix
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&token_path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&token_path, perms)?;
+    }
+    
+    Ok(())
 }
 
 async fn establish_connection(
@@ -1461,6 +1771,13 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(title, chunks[0]);
 
     match app.current_screen {
+        // Registration screens
+        CurrentScreen::Registration => render_registration_error(f, chunks[1]),
+        CurrentScreen::KeySelection => render_key_selection(f, app, chunks[1]),
+        CurrentScreen::UsernameInput => render_username_input(f, app, chunks[1]),
+        CurrentScreen::RegistrationSuccess => render_registration_success(f, app, chunks[1]),
+        
+        // Main screens
         CurrentScreen::RoomChoice => render_room_choice(f, chunks[1]),
         CurrentScreen::RoomList => render_room_list(f, app, chunks[1]),
         CurrentScreen::RoomTypeSelection => render_room_type_selection(f, app, chunks[1]),
@@ -1727,6 +2044,132 @@ fn render_room_switcher_overlay(f: &mut Frame, app: &App, area: Rect) {
     // Clear background and render overlay
     f.render_widget(Clear, overlay_area);
     f.render_widget(list, overlay_area);
+}
+
+fn render_registration_error(f: &mut Frame, area: Rect) {
+    let text = Text::from(vec![
+        Line::from(""),
+        Line::from("No SSH keys found!").style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Line::from(""),
+        Line::from("RadioChat requires an SSH key for authentication."),
+        Line::from(""),
+        Line::from("To create one, run:"),
+        Line::from("  ssh-keygen -t ed25519").style(Style::default().fg(Color::Cyan)),
+        Line::from(""),
+        Line::from("Then press 'r' to retry or 'q' to quit."),
+    ]);
+    
+    let paragraph = Paragraph::new(text)
+        .alignment(Alignment::Center)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("Registration")
+            .border_style(Style::default().fg(Color::Red)));
+    f.render_widget(paragraph, area);
+}
+
+fn render_key_selection(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app.available_keys
+        .iter()
+        .enumerate()
+        .map(|(i, (path, content))| {
+            // Extract key type and truncate the key
+            let key_type = if content.starts_with("ssh-ed25519") {
+                "ed25519"
+            } else {
+                "rsa"
+            };
+            
+            // Get filename from path
+            let filename = path.split('/').last().unwrap_or(path);
+            let display = format!("{} ({})", filename, key_type);
+            
+            let style = if i == app.selected_key_index {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            
+            ListItem::new(display).style(style)
+        })
+        .collect();
+    
+    let list = List::new(items)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("Select SSH Key - [j/k] Navigate [Enter] Select [q] Quit")
+            .border_style(Style::default().fg(Color::Cyan)));
+    
+    f.render_widget(list, area);
+}
+
+fn render_username_input(f: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Info
+            Constraint::Length(3),  // Username input
+            Constraint::Min(1),     // Help
+        ])
+        .margin(2)
+        .split(area);
+    
+    // Show selected key info
+    let key_info = if let Some((path, _)) = app.available_keys.get(app.selected_key_index) {
+        let filename = path.split('/').last().unwrap_or(path);
+        format!("Using key: {}", filename)
+    } else {
+        "No key selected".to_string()
+    };
+    
+    let info = Paragraph::new(key_info)
+        .style(Style::default().fg(Color::Green))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title("Selected Key"));
+    f.render_widget(info, chunks[0]);
+    
+    // Username input
+    f.render_widget(&app.username_input, chunks[1]);
+    
+    // Help text
+    let help = Paragraph::new("Enter a username for your account.\nPress Enter to register, Esc to go back.")
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title("Help"));
+    f.render_widget(help, chunks[2]);
+}
+
+fn render_registration_success(f: &mut Frame, app: &App, area: Rect) {
+    let token_display = app.registration_token
+        .as_ref()
+        .map(|t| {
+            if t.len() > 40 {
+                format!("{}...", &t[..40])
+            } else {
+                t.clone()
+            }
+        })
+        .unwrap_or_else(|| "No token".to_string());
+    
+    let text = Text::from(vec![
+        Line::from(""),
+        Line::from("Registration Successful!").style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Line::from(""),
+        Line::from("Your authentication token has been saved to:"),
+        Line::from("  ~/.config/radiochat/token").style(Style::default().fg(Color::Cyan)),
+        Line::from(""),
+        Line::from(format!("Token: {}", token_display)).style(Style::default().fg(Color::DarkGray)),
+        Line::from(""),
+        Line::from(""),
+        Line::from("Press Enter to continue to RadioChat"),
+    ]);
+    
+    let paragraph = Paragraph::new(text)
+        .alignment(Alignment::Center)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("Registration Complete")
+            .border_style(Style::default().fg(Color::Green)));
+    f.render_widget(paragraph, area);
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
