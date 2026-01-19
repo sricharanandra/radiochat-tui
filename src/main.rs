@@ -44,6 +44,7 @@ enum CurrentScreen {
     RoomJoining,
     InRoom,
     RoomSwitcher,
+    Help,
     QuitConfirmation,
 }
 
@@ -333,6 +334,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                         }
                         CurrentScreen::InRoom => handle_in_room_screen(app, key).await,
                         CurrentScreen::RoomSwitcher => handle_room_switcher_screen(app, key).await,
+                        CurrentScreen::Help => handle_help_screen(app, key),
                         CurrentScreen::QuitConfirmation => handle_quit_confirmation_screen(app, key),
                     }
                 }
@@ -1063,6 +1065,22 @@ async fn handle_room_switcher_screen(app: &mut App<'_>, key: event::KeyEvent) {
     }
 }
 
+fn handle_help_screen(app: &mut App, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+            // Return to previous screen (RoomChoice or InRoom)
+            if app.room_id.is_some() {
+                app.current_screen = CurrentScreen::InRoom;
+                app.status_message = "-- NORMAL --".to_string();
+            } else {
+                app.current_screen = CurrentScreen::RoomChoice;
+                app.status_message = "Create or Join a secure room.".to_string();
+            }
+        }
+        _ => {}
+    }
+}
+
 // --- Command Mode ---
 
 async fn execute_command(app: &mut App<'_>, cmd: &str) {
@@ -1091,7 +1109,8 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
         }
         // Help command
         "h" | "help" => {
-            app.status_message = "Commands: :q (quit/leave) :help :register :list :switch <room>".to_string();
+            app.current_screen = CurrentScreen::Help;
+            app.status_message = "Press Esc, q, or Enter to close help".to_string();
         }
         // List rooms (room switcher)
         "l" | "list" => {
@@ -1790,6 +1809,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             render_in_room(f, app, chunks[1]);
             render_room_switcher_overlay(f, app, chunks[1]);
         }
+        CurrentScreen::Help => render_help(f, chunks[1]),
         CurrentScreen::QuitConfirmation => render_quit_confirmation(f, chunks[1]),
     }
 
@@ -2169,6 +2189,54 @@ fn render_registration_success(f: &mut Frame, app: &App, area: Rect) {
             .borders(Borders::ALL)
             .title("Registration Complete")
             .border_style(Style::default().fg(Color::Green)));
+    f.render_widget(paragraph, area);
+}
+
+fn render_help(f: &mut Frame, area: Rect) {
+    let text = Text::from(vec![
+        Line::from("RadioChat Help").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Line::from(""),
+        Line::from("COMMANDS").style(Style::default().add_modifier(Modifier::BOLD)),
+        Line::from("  :q, :quit, :leave    Quit app or leave room"),
+        Line::from("  :help, :h            Show this help screen"),
+        Line::from("  :register, :reg      Start registration flow"),
+        Line::from("  :list, :l            Show room switcher (in room)"),
+        Line::from("  :switch <room>, :s   Switch to room by name"),
+        Line::from(""),
+        Line::from("MAIN MENU").style(Style::default().add_modifier(Modifier::BOLD)),
+        Line::from("  c                    Create a new room"),
+        Line::from("  j                    Join / browse rooms"),
+        Line::from("  :                    Enter command mode"),
+        Line::from("  Ctrl+C               Show quit confirmation"),
+        Line::from(""),
+        Line::from("ROOM LIST").style(Style::default().add_modifier(Modifier::BOLD)),
+        Line::from("  j/k or Up/Down       Navigate rooms"),
+        Line::from("  Tab                  Switch public/private tabs"),
+        Line::from("  Enter                Join selected room"),
+        Line::from("  r                    Refresh room list"),
+        Line::from("  Esc                  Go back"),
+        Line::from(""),
+        Line::from("IN ROOM (Vim Mode)").style(Style::default().add_modifier(Modifier::BOLD)),
+        Line::from("  i, a, A, I, o, O     Enter insert mode"),
+        Line::from("  Esc                  Exit to normal mode"),
+        Line::from("  h/j/k/l              Move cursor"),
+        Line::from("  w/b                  Word forward/back"),
+        Line::from("  0/$                  Line start/end"),
+        Line::from("  gg/G                 Document top/bottom"),
+        Line::from("  dd                   Delete line"),
+        Line::from("  yy                   Yank (copy) line"),
+        Line::from("  p                    Paste"),
+        Line::from("  u / Ctrl+r           Undo / Redo"),
+        Line::from("  Enter                Send message"),
+        Line::from(""),
+        Line::from("Press Esc, q, or Enter to close this help"),
+    ]);
+    
+    let paragraph = Paragraph::new(text)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("Help")
+            .border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(paragraph, area);
 }
 
