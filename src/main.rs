@@ -77,6 +77,9 @@ struct App<'a> {
     // Clipboard & Config
     clipboard: Option<ClipboardManager>,
     config: Config,
+    
+    // Command Mode
+    command_input: Option<String>,
 }
 
 impl<'a> Default for App<'a> {
@@ -121,6 +124,7 @@ impl<'a> Default for App<'a> {
             config: Config::load(),
             vim_state: VimState::default(),
             message_scroll_offset: 0,
+            command_input: None,
         }
     }
 }
@@ -208,7 +212,38 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                     if (key.code == KeyCode::Esc && key.modifiers.contains(KeyModifiers::CONTROL))
                         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
                     {
+                        app.command_input = None; // Cancel command mode if active
                         app.current_screen = CurrentScreen::QuitConfirmation;
+                        continue;
+                    }
+                    
+                    // Handle command mode input
+                    if app.command_input.is_some() {
+                        match key.code {
+                            KeyCode::Esc => {
+                                // Cancel command mode
+                                app.command_input = None;
+                            }
+                            KeyCode::Enter => {
+                                // Execute command
+                                if let Some(cmd) = app.command_input.take() {
+                                    execute_command(app, &cmd).await;
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                // Delete last character
+                                if let Some(ref mut cmd) = app.command_input {
+                                    cmd.pop();
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                // Append character
+                                if let Some(ref mut cmd) = app.command_input {
+                                    cmd.push(c);
+                                }
+                            }
+                            _ => {}
+                        }
                         continue;
                     }
                     
@@ -337,6 +372,25 @@ async fn handle_room_list_screen(
         }
         KeyCode::Esc => {
             app.current_screen = CurrentScreen::RoomChoice;
+        }
+        // Vim-style navigation
+        KeyCode::Char('j') => {
+            let room_count = if app.viewing_private {
+                app.private_rooms.len()
+            } else {
+                app.public_rooms.len()
+            };
+            if app.selected_room_index + 1 < room_count {
+                app.selected_room_index += 1;
+            }
+        }
+        KeyCode::Char('k') => {
+            if app.selected_room_index > 0 {
+                app.selected_room_index -= 1;
+            }
+        }
+        KeyCode::Char(':') => {
+            app.command_input = Some(String::new());
         }
         _ => {}
     }
@@ -672,10 +726,9 @@ async fn handle_normal_mode(app: &mut App<'_>, key: event::KeyEvent) {
             send_message(app).await;
         }
 
-        // Command mode - for now, just : triggers quit confirmation
+        // Enter command mode
         KeyCode::Char(':') => {
-            // Show quit confirmation (simplified command mode)
-            app.current_screen = CurrentScreen::QuitConfirmation;
+            app.command_input = Some(String::new());
         }
 
         _ => {
@@ -760,6 +813,46 @@ fn handle_quit_confirmation_screen(app: &mut App<'_>, key: event::KeyEvent) {
             }
         }
         _ => {}
+    }
+}
+
+// --- Command Mode ---
+
+async fn execute_command(app: &mut App<'_>, cmd: &str) {
+    let cmd = cmd.trim();
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let command = parts.first().map(|s| *s).unwrap_or("");
+    
+    match command {
+        // Quit commands
+        "q" | "quit" | "leave" => {
+            match app.current_screen {
+                CurrentScreen::InRoom => {
+                    // Leave room, return to main menu
+                    app.room_id = None;
+                    app.room_name = None;
+                    app.room_key = None;
+                    app.messages.clear();
+                    app.current_screen = CurrentScreen::RoomChoice;
+                    app.status_message = "Left room. Press C to create or J to join.".to_string();
+                }
+                _ => {
+                    // Quit application
+                    app.current_screen = CurrentScreen::QuitConfirmation;
+                }
+            }
+        }
+        // Help command
+        "h" | "help" => {
+            app.status_message = "Commands: :q (quit/leave) :help :register :list :switch <room>".to_string();
+        }
+        // Unknown command
+        "" => {
+            // Empty command, do nothing
+        }
+        _ => {
+            app.status_message = format!("Unknown command: {}. Type :help for list.", command);
+        }
     }
 }
 
@@ -1397,9 +1490,16 @@ fn render_quit_confirmation(f: &mut Frame, area: Rect) {
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
-    let footer_text = Paragraph::new(app.status_message.as_str())
-        .style(Style::default().fg(Color::Yellow))
-        .alignment(Alignment::Center)
+    // Show command input if in command mode, otherwise show status message
+    let (text, style) = if let Some(ref cmd) = app.command_input {
+        (format!(":{}", cmd), Style::default().fg(Color::Cyan))
+    } else {
+        (app.status_message.clone(), Style::default().fg(Color::Yellow))
+    };
+    
+    let footer_text = Paragraph::new(text)
+        .style(style)
+        .alignment(Alignment::Left)
         .block(Block::default().borders(Borders::ALL).title("Status"));
     f.render_widget(footer_text, area);
 }
