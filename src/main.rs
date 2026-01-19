@@ -31,6 +31,7 @@ use tui_textarea::TextArea;
 enum CurrentScreen {
     RoomChoice,
     RoomList,
+    RoomTypeSelection,  // NEW: Select public/private
     RoomCreation,
     CreateRoomInput,
     RoomJoining,
@@ -68,6 +69,9 @@ struct App<'a> {
     private_rooms: Vec<RoomInfo>,
     selected_room_index: usize,
     viewing_private: bool,
+    
+    // Room Creation
+    selected_room_type: bool,  // false = public, true = private
 
     // WebSocket
     ws_sender: Option<mpsc::UnboundedSender<String>>,
@@ -117,6 +121,7 @@ impl<'a> Default for App<'a> {
             private_rooms: Vec::new(),
             selected_room_index: 0,
             viewing_private: false,
+            selected_room_type: false,  // false = public, true = private
             ws_sender: None,
             reconnect_attempts: 0,
             is_reconnecting: false,
@@ -250,6 +255,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                     match app.current_screen {
                         CurrentScreen::RoomChoice => handle_room_choice_screen(app, key).await,
                         CurrentScreen::RoomList => handle_room_list_screen(app, key, ws_incoming_tx.clone()).await,
+                        CurrentScreen::RoomTypeSelection => handle_room_type_selection_screen(app, key).await,
                         CurrentScreen::CreateRoomInput => {
                             handle_create_room_input_screen(app, key, ws_incoming_tx.clone()).await
                         }
@@ -281,9 +287,9 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
 async fn handle_room_choice_screen(app: &mut App<'_>, key: event::KeyEvent) {
     match key.code {
         KeyCode::Char('c') | KeyCode::Char('C') => {
-            app.current_screen = CurrentScreen::CreateRoomInput;
-            app.currently_editing = Some(CurrentlyEditing::RoomName);
-            app.status_message = "Enter a name for your new room (e.g., team-chat)".to_string();
+            app.current_screen = CurrentScreen::RoomTypeSelection;
+            app.selected_room_type = false;  // Default to public
+            app.status_message = "Select room type: Tab to switch, Enter to continue".to_string();
         }
         KeyCode::Char('j') | KeyCode::Char('J') => {
             app.current_screen = CurrentScreen::RoomList;
@@ -299,6 +305,33 @@ async fn handle_room_choice_screen(app: &mut App<'_>, key: event::KeyEvent) {
                     let _ = ws_sender.send(json);
                 }
             }
+        }
+        _ => {}
+    }
+}
+
+async fn handle_room_type_selection_screen(app: &mut App<'_>, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Tab => {
+            // Toggle between public and private
+            app.selected_room_type = !app.selected_room_type;
+            let type_str = if app.selected_room_type { "Private" } else { "Public" };
+            app.status_message = format!("Room type: {} - Tab to switch, Enter to continue", type_str);
+        }
+        KeyCode::Enter => {
+            // Continue to room name input
+            app.current_screen = CurrentScreen::CreateRoomInput;
+            app.currently_editing = Some(CurrentlyEditing::RoomName);
+            let type_str = if app.selected_room_type { "private" } else { "public" };
+            app.status_message = format!("Creating {} room - enter a name", type_str);
+        }
+        KeyCode::Esc => {
+            // Go back to main menu
+            app.current_screen = CurrentScreen::RoomChoice;
+            app.status_message = "Create or Join a secure room.".to_string();
+        }
+        KeyCode::Char(':') => {
+            app.command_input = Some(String::new());
         }
         _ => {}
     }
@@ -413,10 +446,11 @@ async fn handle_create_room_input_screen(
             
             // Create room using existing WebSocket connection
             if let Some(ws_sender) = &app.ws_sender {
+                let room_type_str = if app.selected_room_type { "private" } else { "public" };
                 let create_payload = CreateRoomPayload {
                     name: &room_name,
                     display_name: None,
-                    room_type: "public",
+                    room_type: room_type_str,
                 };
                 let create_message = ClientMessage {
                     message_type: "createRoom",
@@ -1315,6 +1349,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     match app.current_screen {
         CurrentScreen::RoomChoice => render_room_choice(f, chunks[1]),
         CurrentScreen::RoomList => render_room_list(f, app, chunks[1]),
+        CurrentScreen::RoomTypeSelection => render_room_type_selection(f, app, chunks[1]),
         CurrentScreen::CreateRoomInput => render_create_room_input(f, app, chunks[1]),
         CurrentScreen::RoomCreation => render_room_creation(f, app, chunks[1]),
         CurrentScreen::RoomJoining => render_room_joining(f, app, chunks[1]),
@@ -1377,6 +1412,46 @@ fn render_room_list(f: &mut Frame, app: &App, area: Rect) {
         );
     
     f.render_widget(list, area);
+}
+
+fn render_room_type_selection(f: &mut Frame, app: &App, area: Rect) {
+    let public_style = if !app.selected_room_type {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    
+    let private_style = if app.selected_room_type {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    
+    let public_marker = if !app.selected_room_type { "> " } else { "  " };
+    let private_marker = if app.selected_room_type { "> " } else { "  " };
+    
+    let text = Text::from(vec![
+        Line::from("Select Room Type"),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(public_marker),
+            Span::styled("Public", public_style),
+            Span::raw("  - Anyone can discover and join"),
+        ]),
+        Line::from(vec![
+            Span::raw(private_marker),
+            Span::styled("Private", private_style),
+            Span::raw(" - Only visible to members"),
+        ]),
+        Line::from(""),
+        Line::from(""),
+        Line::from("[Tab] Switch type  [Enter] Continue  [Esc] Cancel"),
+    ]);
+    
+    let paragraph = Paragraph::new(text)
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title("Create Room"));
+    f.render_widget(paragraph, area);
 }
 
 fn render_create_room_input(f: &mut Frame, app: &mut App, area: Rect) {
