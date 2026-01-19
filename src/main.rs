@@ -21,6 +21,7 @@ use ratatui::{
 };
 use std::{error::Error, io};
 use tokio::sync::mpsc;
+use tokio::time::{interval, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tui_textarea::TextArea;
 
@@ -1025,11 +1026,25 @@ async fn try_connect(
         }
     });
 
-    // Task to send outgoing messages from the app to the server
+    // Task to send outgoing messages from the app to the server, with periodic pings
     tokio::spawn(async move {
-        while let Some(json) = ws_outgoing_rx.recv().await {
-            if write.send(Message::text(json)).await.is_err() {
-                break;
+        let mut ping_interval = interval(Duration::from_secs(30));
+        ping_interval.tick().await; // Skip the first immediate tick
+        
+        loop {
+            tokio::select! {
+                // Handle outgoing messages
+                Some(json) = ws_outgoing_rx.recv() => {
+                    if write.send(Message::text(json)).await.is_err() {
+                        break;
+                    }
+                }
+                // Send periodic pings to keep connection alive
+                _ = ping_interval.tick() => {
+                    if write.send(Message::Ping(vec![])).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -1083,11 +1098,25 @@ async fn connect(
         }
     });
 
-    // Task to send outgoing messages from the app to the server
+    // Task to send outgoing messages from the app to the server, with periodic pings
     tokio::spawn(async move {
-        while let Some(json) = ws_outgoing_rx.recv().await {
-            if write.send(Message::text(json)).await.is_err() {
-                break;
+        let mut ping_interval = interval(Duration::from_secs(30));
+        ping_interval.tick().await; // Skip the first immediate tick
+        
+        loop {
+            tokio::select! {
+                // Handle outgoing messages
+                Some(json) = ws_outgoing_rx.recv() => {
+                    if write.send(Message::text(json)).await.is_err() {
+                        break;
+                    }
+                }
+                // Send periodic pings to keep connection alive
+                _ = ping_interval.tick() => {
+                    if write.send(Message::Ping(vec![])).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
