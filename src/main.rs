@@ -3,6 +3,7 @@ mod crypto;
 mod clipboard;
 mod config;
 mod vim;
+mod emoji;
 
 use crate::crypto::{decrypt, encrypt, AesKey};
 use crate::clipboard::ClipboardManager;
@@ -100,6 +101,12 @@ struct App<'a> {
     username_input: TextArea<'a>,
     registration_token: Option<String>,
     registration_error: Option<String>,
+    
+    // Emoji Picker
+    emoji_picker_active: bool,
+    emoji_matches: Vec<(&'static str, &'static str, &'static str)>, // (shortcode, emoji, description)
+    emoji_selected_index: usize,
+    emoji_partial: String,  // The partial shortcode being typed (without the leading :)
 }
 
 impl<'a> Default for App<'a> {
@@ -153,6 +160,10 @@ impl<'a> Default for App<'a> {
             },
             registration_token: None,
             registration_error: None,
+            emoji_picker_active: false,
+            emoji_matches: Vec::new(),
+            emoji_selected_index: 0,
+            emoji_partial: String::new(),
         }
     }
 }
@@ -855,6 +866,83 @@ async fn handle_normal_mode(app: &mut App<'_>, key: event::KeyEvent) {
 }
 
 async fn handle_insert_mode(app: &mut App<'_>, key: event::KeyEvent) {
+    // If emoji picker is active, handle picker navigation
+    if app.emoji_picker_active {
+        match key.code {
+            KeyCode::Esc => {
+                // Close emoji picker
+                app.emoji_picker_active = false;
+                app.emoji_matches.clear();
+                app.emoji_partial.clear();
+                app.emoji_selected_index = 0;
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                // Select the current emoji
+                if let Some((_, emoji, _)) = app.emoji_matches.get(app.emoji_selected_index) {
+                    // Delete the partial shortcode (including the leading :)
+                    let delete_count = app.emoji_partial.len() + 1; // +1 for the ':'
+                    for _ in 0..delete_count {
+                        app.message_input.delete_char();
+                    }
+                    // Insert the emoji
+                    app.message_input.insert_str(*emoji);
+                }
+                // Close picker
+                app.emoji_picker_active = false;
+                app.emoji_matches.clear();
+                app.emoji_partial.clear();
+                app.emoji_selected_index = 0;
+            }
+            KeyCode::Up => {
+                if app.emoji_selected_index > 0 {
+                    app.emoji_selected_index -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if app.emoji_selected_index + 1 < app.emoji_matches.len() {
+                    app.emoji_selected_index += 1;
+                }
+            }
+            KeyCode::Char(c) => {
+                // Continue typing the shortcode
+                app.emoji_partial.push(c);
+                app.emoji_matches = emoji::find_matching_emojis(&app.emoji_partial);
+                app.emoji_selected_index = 0;
+                // If no matches, close picker
+                if app.emoji_matches.is_empty() {
+                    app.emoji_picker_active = false;
+                    app.emoji_partial.clear();
+                }
+                // Also pass to input
+                app.message_input.input(Event::Key(key));
+            }
+            KeyCode::Backspace => {
+                if !app.emoji_partial.is_empty() {
+                    app.emoji_partial.pop();
+                    if app.emoji_partial.is_empty() {
+                        // User deleted back to just ':', close picker
+                        app.emoji_picker_active = false;
+                        app.emoji_matches.clear();
+                    } else {
+                        app.emoji_matches = emoji::find_matching_emojis(&app.emoji_partial);
+                        app.emoji_selected_index = 0;
+                    }
+                }
+                app.message_input.input(Event::Key(key));
+            }
+            _ => {
+                // Any other key closes the picker and passes through
+                app.emoji_picker_active = false;
+                app.emoji_matches.clear();
+                app.emoji_partial.clear();
+                app.emoji_selected_index = 0;
+                app.message_input.input(Event::Key(key));
+            }
+        }
+        return;
+    }
+    
+    // Normal insert mode handling
     match key.code {
         KeyCode::Esc => {
             // Exit Insert mode back to Normal mode
@@ -862,8 +950,22 @@ async fn handle_insert_mode(app: &mut App<'_>, key: event::KeyEvent) {
             app.status_message = "-- NORMAL --".to_string();
         }
         KeyCode::Enter => {
-            // In Insert mode, Enter sends the message
-            send_message(app).await;
+            // Shift+Enter inserts a newline, plain Enter sends the message
+            if key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                // Insert newline for multi-line messages
+                app.message_input.insert_newline();
+            } else {
+                // Send the message
+                send_message(app).await;
+            }
+        }
+        KeyCode::Char(':') => {
+            // Start emoji picker detection
+            app.message_input.input(Event::Key(key));
+            app.emoji_picker_active = true;
+            app.emoji_partial.clear();
+            app.emoji_matches.clear();
+            app.emoji_selected_index = 0;
         }
         _ => {
             // Pass all other keys to the text input
@@ -983,6 +1085,10 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
     let command = parts.first().map(|s| *s).unwrap_or("");
     
     match command {
+        // Force quit - exit app from anywhere
+        "qq" | "qa" | "quit!" => {
+            app.should_quit = true;
+        }
         // Quit commands
         "q" | "quit" | "leave" => {
             match app.current_screen {
@@ -1684,6 +1790,56 @@ fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
             })
     );
     f.render_widget(&app.message_input, chunks[1]);
+    
+    // Render emoji picker overlay if active
+    if app.emoji_picker_active && !app.emoji_matches.is_empty() {
+        render_emoji_picker(f, app, chunks[1]);
+    }
+}
+
+fn render_emoji_picker(f: &mut Frame, app: &App, input_area: Rect) {
+    // Position the picker above the input area
+    let picker_height = (app.emoji_matches.len() as u16).min(8) + 2; // +2 for borders
+    let picker_width = 40;
+    
+    // Position above the input, aligned to the left
+    let picker_x = input_area.x + 1;
+    let picker_y = input_area.y.saturating_sub(picker_height);
+    
+    let picker_area = Rect {
+        x: picker_x,
+        y: picker_y,
+        width: picker_width.min(input_area.width.saturating_sub(2)),
+        height: picker_height,
+    };
+    
+    // Clear the area behind the picker
+    f.render_widget(Clear, picker_area);
+    
+    // Create list items for emoji suggestions
+    let items: Vec<ListItem> = app
+        .emoji_matches
+        .iter()
+        .enumerate()
+        .map(|(i, (shortcode, emoji, _desc))| {
+            let style = if i == app.emoji_selected_index {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            ListItem::new(format!("{} :{}", emoji, shortcode)).style(style)
+        })
+        .collect();
+    
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(format!(":{} - ↑↓ Tab/Enter", app.emoji_partial))
+        );
+    
+    f.render_widget(list, picker_area);
 }
 
 fn render_room_switcher_overlay(f: &mut Frame, app: &App, area: Rect) {
@@ -1864,6 +2020,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("COMMANDS").style(Style::default().add_modifier(Modifier::BOLD)),
         Line::from("  :q, :quit, :leave    Quit app or leave room"),
+        Line::from("  :qq, :qa, :quit!     Force quit from anywhere"),
         Line::from("  :help, :h            Show this help screen"),
         Line::from("  :register, :reg      Start registration flow"),
         Line::from("  :list, :l            Show room switcher (in room)"),
@@ -1873,7 +2030,6 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  c                    Create a new room"),
         Line::from("  j                    Join / browse rooms"),
         Line::from("  :                    Enter command mode"),
-        Line::from("  Ctrl+C               Show quit confirmation"),
         Line::from(""),
         Line::from("ROOM LIST").style(Style::default().add_modifier(Modifier::BOLD)),
         Line::from("  j/k or Up/Down       Navigate rooms"),
@@ -1894,6 +2050,9 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  p                    Paste"),
         Line::from("  u / Ctrl+r           Undo / Redo"),
         Line::from("  Enter                Send message"),
+        Line::from("  Shift+Enter          New line (multi-line msg)"),
+        Line::from("  :emoji:              Emoji picker (e.g. :smile:)"),
+        Line::from("  Mouse scroll         Scroll message history"),
         Line::from(""),
         Line::from("Press Esc, q, or Enter to close this help"),
     ]);
