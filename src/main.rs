@@ -997,6 +997,11 @@ async fn send_message(app: &mut App<'_>) {
                             app.message_input.set_block(
                                 Block::default().borders(Borders::ALL).title("Message"),
                             );
+                            // Reset emoji picker state
+                            app.emoji_picker_active = false;
+                            app.emoji_matches.clear();
+                            app.emoji_partial.clear();
+                            app.emoji_selected_index = 0;
                             // Stay in current vim mode after sending
                             if app.vim_state.mode == VimMode::Normal {
                                 app.status_message = "-- NORMAL --".to_string();
@@ -1759,23 +1764,26 @@ fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
     let visible_height = chunks[0].height.saturating_sub(2) as usize;
     let total_messages = app.messages.len();
     
-    // Calculate which messages to show based on scroll offset
-    // offset 0 = at bottom (newest), offset > 0 = scrolled up
-    let end_idx = total_messages.saturating_sub(app.message_scroll_offset);
-    let start_idx = end_idx.saturating_sub(visible_height);
+    // Create text content from messages
+    let text_content: Vec<Line> = app.messages.iter().map(|m| Line::from(m.clone())).collect();
     
-    let visible_messages: Vec<ListItem> = app
-        .messages
-        .iter()
-        .skip(start_idx)
-        .take(end_idx - start_idx)
-        .map(|m| ListItem::new(m.clone()))
-        .collect();
+    // Calculate scroll position to show latest messages at the bottom
+    // When offset is 0, we want to see the last messages
+    // scroll_y = total_lines - visible_height (to show bottom)
+    let scroll_y = if total_messages > visible_height {
+        (total_messages - visible_height).saturating_sub(app.message_scroll_offset)
+    } else {
+        0
+    };
     
-    let messages_list = List::new(visible_messages).block(Block::default().borders(Borders::ALL).title(
-        format!("Room: {}", app.room_id.as_deref().unwrap_or("Unknown")),
-    ));
-    f.render_widget(messages_list, chunks[0]);
+    let messages_paragraph = Paragraph::new(text_content)
+        .block(Block::default().borders(Borders::ALL).title(
+            format!("Room: {}", app.room_id.as_deref().unwrap_or("Unknown")),
+        ))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y as u16, 0));
+    
+    f.render_widget(messages_paragraph, chunks[0]);
 
     // Update message input block to show vim mode
     let vim_mode_str = app.vim_state.mode.as_str();
