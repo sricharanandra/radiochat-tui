@@ -42,7 +42,7 @@ pub struct NetworkConfig {
 
 fn default_server_url() -> String {
     std::env::var("RADIOCHAT_SERVER_URL")
-        .unwrap_or_else(|_| "ws://localhost:8081/ws".to_string())
+        .unwrap_or_else(|_| "wss://radiochat.sreus.tech/ws".to_string())
 }
 
 fn default_token_path() -> String {
