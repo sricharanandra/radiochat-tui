@@ -1122,6 +1122,7 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
                     Ok(plaintext) => {
                         let formatted = format!("[{}] {}", payload.username, plaintext);
                         app.messages.push(formatted);
+                        app.message_scroll_offset = 0; // Auto-scroll to bottom
                     }
                     Err(_) => app
                         .messages
@@ -1132,10 +1133,12 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
         ServerMessage::UserJoined(payload) => {
             app.messages
                 .push(format!("→ {} joined the room", payload.username));
+            app.message_scroll_offset = 0; // Auto-scroll to bottom
         }
         ServerMessage::UserLeft(payload) => {
             app.messages
                 .push(format!("← {} left the room", payload.username));
+            app.message_scroll_offset = 0; // Auto-scroll to bottom
         }
         ServerMessage::RoomJoined(payload) => {
             app.status_message = format!("Joined room: {}", payload.display_name);
@@ -1646,12 +1649,24 @@ fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(area);
 
-    let messages: Vec<ListItem> = app
+    // Calculate visible height (subtract 2 for borders)
+    let visible_height = chunks[0].height.saturating_sub(2) as usize;
+    let total_messages = app.messages.len();
+    
+    // Calculate which messages to show based on scroll offset
+    // offset 0 = at bottom (newest), offset > 0 = scrolled up
+    let end_idx = total_messages.saturating_sub(app.message_scroll_offset);
+    let start_idx = end_idx.saturating_sub(visible_height);
+    
+    let visible_messages: Vec<ListItem> = app
         .messages
         .iter()
+        .skip(start_idx)
+        .take(end_idx - start_idx)
         .map(|m| ListItem::new(m.clone()))
         .collect();
-    let messages_list = List::new(messages).block(Block::default().borders(Borders::ALL).title(
+    
+    let messages_list = List::new(visible_messages).block(Block::default().borders(Borders::ALL).title(
         format!("Room: {}", app.room_id.as_deref().unwrap_or("Unknown")),
     ));
     f.render_widget(messages_list, chunks[0]);
