@@ -1528,6 +1528,9 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
         ServerMessage::RoomJoined(payload) => {
             app.status_message = format!("Joined room: {}", payload.display_name);
             
+            // Force switch to InRoom screen
+            app.current_screen = CurrentScreen::InRoom;
+            
             // Store room info
             app.room_id = Some(payload.room_id.clone());
             app.room_name = Some(payload.room_name.clone());
@@ -2549,7 +2552,8 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>, Box<dyn Error>> {
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableFocusChange)?;
+    // Removed EnableMouseCapture to allow native terminal selection
+    execute!(stdout, EnterAlternateScreen, EnableFocusChange)?;
     enable_raw_mode()?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
@@ -2562,8 +2566,8 @@ fn restore_terminal(
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
+        LeaveAlternateScreen
+        // Removed DisableMouseCapture
     )?;
     terminal.show_cursor()?;
     Ok(())
