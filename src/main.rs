@@ -103,6 +103,7 @@ struct App<'a> {
     // Room Data
     room_id: Option<String>,
     room_name: Option<String>,
+    room_display_name: Option<String>,
     room_key: Option<AesKey>,
     messages: Vec<ChatMessage>,
     online_users: Vec<String>,  // Usernames of online users in current room
@@ -179,6 +180,7 @@ impl<'a> Default for App<'a> {
             current_username: None,
             room_id: None,
             room_name: None,
+            room_display_name: None,
             room_key: None,
             messages: Vec::new(),
             online_users: Vec::new(),
@@ -1580,6 +1582,7 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             // Store room info
             app.room_id = Some(payload.room_id.clone());
             app.room_name = Some(payload.room_name.clone());
+            app.room_display_name = Some(payload.display_name.clone());
             
             // Store the room key from the server
             if !payload.encrypted_key.is_empty() {
@@ -1615,6 +1618,7 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             app.status_message = format!("Room created: {}", payload.display_name);
             app.room_id = Some(payload.room_id);
             app.room_name = Some(payload.room_name);
+            app.room_display_name = Some(payload.display_name.clone());
             
             // Store the room key from the server
             if !payload.encrypted_key.is_empty() {
@@ -1680,6 +1684,7 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             if let Some(current_room_id) = &app.room_id {
                 if current_room_id == &payload.room_id {
                     app.room_name = Some(payload.new_name.clone());
+                    app.room_display_name = Some(payload.display_name.clone());
                     app.status_message = format!("Room renamed to {}", payload.display_name);
                 }
             }
@@ -2229,7 +2234,7 @@ fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
     
     let messages_paragraph = Paragraph::new(text_content)
         .block(Block::default().borders(Borders::ALL).title(
-            format!("Room: {}", app.room_id.as_deref().unwrap_or("Unknown")),
+            format!("Room: {}", app.room_display_name.as_deref().unwrap_or("Unknown")),
         ))
         .wrap(Wrap { trim: false })
         .scroll((scroll_y as u16, 0));
