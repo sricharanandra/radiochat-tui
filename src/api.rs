@@ -78,6 +78,14 @@ pub struct UserLeftPayload {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+pub struct OnlineUser {
+    pub username: String,
+    #[serde(rename = "userId")]
+    #[allow(dead_code)]
+    pub user_id: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
 pub struct RoomJoinedPayload {
     #[serde(rename = "roomId")]
     pub room_id: String,
@@ -91,6 +99,8 @@ pub struct RoomJoinedPayload {
     #[serde(rename = "encryptedKey")]
     pub encrypted_key: String,
     pub messages: Vec<MessagePayload>,
+    #[serde(rename = "onlineUsers", default)]
+    pub online_users: Vec<OnlineUser>,
 }
 
 #[derive(Deserialize, Debug, Clone)]

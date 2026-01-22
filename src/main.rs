@@ -103,10 +103,14 @@ struct App<'a> {
     room_name: Option<String>,
     room_key: Option<AesKey>,
     messages: Vec<ChatMessage>,
+    online_users: Vec<String>,  // Usernames of online users in current room
     
     // Typing indicators (username -> timestamp when they started typing)
     typing_users: std::collections::HashMap<String, std::time::Instant>,
     last_typing_sent: Option<std::time::Instant>,
+    
+    // UI State
+    show_user_list: bool,  // Show user list overlay
     
     // Room List
     public_rooms: Vec<RoomInfo>,
@@ -173,8 +177,10 @@ impl<'a> Default for App<'a> {
             room_name: None,
             room_key: None,
             messages: Vec::new(),
+            online_users: Vec::new(),
             typing_users: std::collections::HashMap::new(),
             last_typing_sent: None,
+            show_user_list: false,
             public_rooms: Vec::new(),
             private_rooms: Vec::new(),
             selected_room_index: 0,
@@ -763,6 +769,15 @@ async fn handle_in_room_screen(app: &mut App<'_>, key: event::KeyEvent) {
 }
 
 async fn handle_normal_mode(app: &mut App<'_>, key: event::KeyEvent) {
+    // Close user list overlay if open
+    if app.show_user_list {
+        if key.code == KeyCode::Esc {
+            app.show_user_list = false;
+            app.status_message = "-- NORMAL --".to_string();
+            return;
+        }
+    }
+    
     match key.code {
         // Enter Insert mode
         KeyCode::Char('i') => {
@@ -1175,6 +1190,8 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                     app.room_name = None;
                     app.room_key = None;
                     app.messages.clear();
+                    app.online_users.clear();
+                    app.typing_users.clear();
                     app.current_screen = CurrentScreen::RoomChoice;
                     app.status_message = "Left room. Press C to create or J to join.".to_string();
                 }
@@ -1188,6 +1205,19 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
         "h" | "help" => {
             app.current_screen = CurrentScreen::Help;
             app.status_message = "Press Esc, q, or Enter to close help".to_string();
+        }
+        // Users command - show online users
+        "u" | "users" => {
+            if app.current_screen == CurrentScreen::InRoom {
+                app.show_user_list = !app.show_user_list;
+                if app.show_user_list {
+                    app.status_message = format!("{} users online. Press Esc to close.", app.online_users.len());
+                } else {
+                    app.status_message = "-- NORMAL --".to_string();
+                }
+            } else {
+                app.status_message = ":users only works inside a room".to_string();
+            }
         }
         // List rooms (room switcher)
         "l" | "list" => {
@@ -1317,11 +1347,19 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             app.messages
                 .push(ChatMessage::system(format!("→ {} joined the room", payload.username)));
             app.message_scroll_offset = 0; // Auto-scroll to bottom
+            // Add to online users list
+            if !app.online_users.contains(&payload.username) {
+                app.online_users.push(payload.username.clone());
+            }
         }
         ServerMessage::UserLeft(payload) => {
             app.messages
                 .push(ChatMessage::system(format!("← {} left the room", payload.username)));
             app.message_scroll_offset = 0; // Auto-scroll to bottom
+            // Remove from online users list
+            app.online_users.retain(|u| u != &payload.username);
+            // Also remove from typing users
+            app.typing_users.remove(&payload.username);
         }
         ServerMessage::RoomJoined(payload) => {
             app.status_message = format!("Joined room: {}", payload.display_name);
@@ -1356,6 +1394,9 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
                     }
                 }
             }
+            
+            // Store online users
+            app.online_users = payload.online_users.iter().map(|u| u.username.clone()).collect();
         }
         ServerMessage::RoomCreated(payload) => {
             app.status_message = format!("Room created: {}", payload.display_name);
@@ -1911,6 +1952,54 @@ fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
     if app.emoji_picker_active && !app.emoji_matches.is_empty() {
         render_emoji_picker(f, app, chunks[1]);
     }
+    
+    // Render user list overlay if active
+    if app.show_user_list {
+        render_user_list_overlay(f, app, area);
+    }
+}
+
+fn render_user_list_overlay(f: &mut Frame, app: &App, area: Rect) {
+    // Calculate centered overlay area
+    let overlay_width = 40.min(area.width.saturating_sub(4));
+    let overlay_height = (app.online_users.len() as u16 + 4).min(area.height.saturating_sub(4));
+    let overlay_x = area.x + (area.width - overlay_width) / 2;
+    let overlay_y = area.y + (area.height - overlay_height) / 2;
+    
+    let overlay_area = Rect {
+        x: overlay_x,
+        y: overlay_y,
+        width: overlay_width,
+        height: overlay_height,
+    };
+    
+    // Clear the area behind the overlay
+    f.render_widget(Clear, overlay_area);
+    
+    // Create list items for online users
+    let items: Vec<ListItem> = app
+        .online_users
+        .iter()
+        .map(|username| {
+            let is_typing = app.typing_users.contains_key(username);
+            let display = if is_typing {
+                format!("● {} (typing...)", username)
+            } else {
+                format!("● {}", username)
+            };
+            ListItem::new(display).style(Style::default().fg(Color::Green))
+        })
+        .collect();
+    
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(format!("Online Users ({}) - Esc to close", app.online_users.len()))
+        );
+    
+    f.render_widget(list, overlay_area);
 }
 
 fn render_emoji_picker(f: &mut Frame, app: &App, input_area: Rect) {
@@ -2138,6 +2227,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  :q, :quit, :leave    Quit app or leave room"),
         Line::from("  :qq, :qa, :quit!     Force quit from anywhere"),
         Line::from("  :help, :h            Show this help screen"),
+        Line::from("  :users, :u           Show online users in room"),
         Line::from("  :register, :reg      Start registration flow"),
         Line::from("  :list, :l            Show room switcher (in room)"),
         Line::from("  :switch <room>, :s   Switch to room by name"),
