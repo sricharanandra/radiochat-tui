@@ -72,6 +72,12 @@ pub struct TransferOwnershipPayload<'a> {
     pub new_owner_username: &'a str,
 }
 
+#[derive(Serialize)]
+pub struct CreateDMPayload<'a> {
+    #[serde(rename = "targetUsername")]
+    pub target_username: &'a str,
+}
+
 // Generic wrapper for all client-sent messages
 #[derive(Serialize)]
 pub struct ClientMessage<'a, T> {

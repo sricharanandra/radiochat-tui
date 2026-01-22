@@ -9,7 +9,7 @@ use crate::crypto::{decrypt, encrypt, AesKey};
 use crate::clipboard::ClipboardManager;
 use crate::config::Config;
 use crate::vim::{VimMode, VimState};
-use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo, TypingPayload, CreateInvitePayload, JoinViaInvitePayload, RenameRoomPayload, DeleteRoomPayload, TransferOwnershipPayload};
+use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo, TypingPayload, CreateInvitePayload, JoinViaInvitePayload, RenameRoomPayload, DeleteRoomPayload, TransferOwnershipPayload, CreateDMPayload};
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
     crossterm::{
@@ -1410,6 +1410,26 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                 app.status_message = ":transfer only works inside a room".to_string();
             }
         }
+        // Direct Message
+        "dm" => {
+            if let Some(target_user) = parts.get(1) {
+                if let Some(ws_sender) = &app.ws_sender {
+                    let payload = CreateDMPayload {
+                        target_username: target_user,
+                    };
+                    let msg = ClientMessage {
+                        message_type: "createDM",
+                        payload,
+                    };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        let _ = ws_sender.send(json);
+                        app.status_message = format!("Opening DM with {}...", target_user);
+                    }
+                }
+            } else {
+                app.status_message = "Usage: :dm <username>".to_string();
+            }
+        }
         // Unknown command
         "" => {
             // Empty command, do nothing
@@ -2410,6 +2430,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  :rename <name>       Rename current room (owner only)"),
         Line::from("  :delete              Delete current room (owner only)"),
         Line::from("  :transfer <user>     Transfer ownership (owner only)"),
+        Line::from("  :dm <username>       Start a direct message chat"),
         Line::from(""),
         Line::from("MAIN MENU").style(Style::default().add_modifier(Modifier::BOLD)),
         Line::from("  c                    Create a new room"),
