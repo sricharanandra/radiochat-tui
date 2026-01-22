@@ -50,6 +50,28 @@ pub struct JoinViaInvitePayload<'a> {
     pub code: &'a str,
 }
 
+#[derive(Serialize)]
+pub struct RenameRoomPayload<'a> {
+    #[serde(rename = "roomId")]
+    pub room_id: &'a str,
+    #[serde(rename = "newName")]
+    pub new_name: &'a str,
+}
+
+#[derive(Serialize)]
+pub struct DeleteRoomPayload<'a> {
+    #[serde(rename = "roomId")]
+    pub room_id: &'a str,
+}
+
+#[derive(Serialize)]
+pub struct TransferOwnershipPayload<'a> {
+    #[serde(rename = "roomId")]
+    pub room_id: &'a str,
+    #[serde(rename = "newOwnerUsername")]
+    pub new_owner_username: &'a str,
+}
+
 // Generic wrapper for all client-sent messages
 #[derive(Serialize)]
 pub struct ClientMessage<'a, T> {
@@ -180,9 +202,38 @@ pub struct InviteCreatedPayload {
     #[allow(dead_code)]
     pub room_id: String,
     #[serde(rename = "roomName")]
+    #[allow(dead_code)]
     pub room_name: String,
     #[serde(rename = "expiresAt")]
+    #[allow(dead_code)]
     pub expires_at: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct RoomRenamedPayload {
+    #[serde(rename = "roomId")]
+    pub room_id: String,
+    #[serde(rename = "newName")]
+    pub new_name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct RoomDeletedPayload {
+    #[serde(rename = "roomId")]
+    pub room_id: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct OwnershipTransferredPayload {
+    #[serde(rename = "roomId")]
+    pub room_id: String,
+    #[serde(rename = "newOwnerUsername")]
+    pub new_owner_username: String,
+    #[serde(rename = "newOwnerId")]
+    #[allow(dead_code)]
+    pub new_owner_id: String,
 }
 
 // Enum to represent all possible incoming server messages
@@ -200,4 +251,7 @@ pub enum ServerMessage {
     Error(ErrorPayload),
     UserTyping(UserTypingPayload),
     InviteCreated(InviteCreatedPayload),
+    RoomRenamed(RoomRenamedPayload),
+    RoomDeleted(RoomDeletedPayload),
+    OwnershipTransferred(OwnershipTransferredPayload),
 }

@@ -9,7 +9,7 @@ use crate::crypto::{decrypt, encrypt, AesKey};
 use crate::clipboard::ClipboardManager;
 use crate::config::Config;
 use crate::vim::{VimMode, VimState};
-use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo, TypingPayload, CreateInvitePayload, JoinViaInvitePayload};
+use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo, TypingPayload, CreateInvitePayload, JoinViaInvitePayload, RenameRoomPayload, DeleteRoomPayload, TransferOwnershipPayload};
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
     crossterm::{
@@ -1334,6 +1334,82 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                 app.status_message = "Usage: :join <code>".to_string();
             }
         }
+        // Rename room
+        "rename" => {
+            if app.current_screen == CurrentScreen::InRoom {
+                if let Some(room_id) = &app.room_id {
+                    if let Some(new_name) = parts.get(1) {
+                        if let Some(ws_sender) = &app.ws_sender {
+                            let payload = RenameRoomPayload {
+                                room_id,
+                                new_name,
+                            };
+                            let msg = ClientMessage {
+                                message_type: "renameRoom",
+                                payload,
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                let _ = ws_sender.send(json);
+                                app.status_message = format!("Renaming room to {}...", new_name);
+                            }
+                        }
+                    } else {
+                        app.status_message = "Usage: :rename <new_name>".to_string();
+                    }
+                }
+            } else {
+                app.status_message = ":rename only works inside a room".to_string();
+            }
+        }
+        // Delete room
+        "delete" => {
+            if app.current_screen == CurrentScreen::InRoom {
+                if let Some(room_id) = &app.room_id {
+                    if let Some(ws_sender) = &app.ws_sender {
+                        let payload = DeleteRoomPayload {
+                            room_id,
+                        };
+                        let msg = ClientMessage {
+                            message_type: "deleteRoom",
+                            payload,
+                        };
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            let _ = ws_sender.send(json);
+                            app.status_message = "Deleting room...".to_string();
+                        }
+                    }
+                }
+            } else {
+                app.status_message = ":delete only works inside a room".to_string();
+            }
+        }
+        // Transfer ownership
+        "transfer" => {
+            if app.current_screen == CurrentScreen::InRoom {
+                if let Some(room_id) = &app.room_id {
+                    if let Some(new_owner) = parts.get(1) {
+                        if let Some(ws_sender) = &app.ws_sender {
+                            let payload = TransferOwnershipPayload {
+                                room_id,
+                                new_owner_username: new_owner,
+                            };
+                            let msg = ClientMessage {
+                                message_type: "transferOwnership",
+                                payload,
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                let _ = ws_sender.send(json);
+                                app.status_message = format!("Transferring ownership to {}...", new_owner);
+                            }
+                        }
+                    } else {
+                        app.status_message = "Usage: :transfer <username>".to_string();
+                    }
+                }
+            } else {
+                app.status_message = ":transfer only works inside a room".to_string();
+            }
+        }
         // Unknown command
         "" => {
             // Empty command, do nothing
@@ -1504,6 +1580,39 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             } else {
                 app.status_message = format!("Invite code: {}", payload.code);
             }
+        }
+        ServerMessage::RoomRenamed(payload) => {
+            if let Some(current_room_id) = &app.room_id {
+                if current_room_id == &payload.room_id {
+                    app.room_name = Some(payload.new_name.clone());
+                    app.status_message = format!("Room renamed to {}", payload.display_name);
+                }
+            }
+            app.messages.push(ChatMessage::system(format!(
+                "Room renamed to {}",
+                payload.display_name
+            )));
+        }
+        ServerMessage::RoomDeleted(payload) => {
+            if let Some(current_room_id) = &app.room_id {
+                if current_room_id == &payload.room_id {
+                    // Leave room
+                    app.room_id = None;
+                    app.room_name = None;
+                    app.room_key = None;
+                    app.messages.clear();
+                    app.online_users.clear();
+                    app.typing_users.clear();
+                    app.current_screen = CurrentScreen::RoomChoice;
+                    app.status_message = "Room was deleted by owner.".to_string();
+                }
+            }
+        }
+        ServerMessage::OwnershipTransferred(payload) => {
+            app.messages.push(ChatMessage::system(format!(
+                "Room ownership transferred to {}",
+                payload.new_owner_username
+            )));
         }
     }
 }
@@ -2298,6 +2407,9 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  :switch <room>, :s   Switch to room by name"),
         Line::from("  :share, :invite      Generate invite code for current room"),
         Line::from("  :join <code>, :j     Join room using invite code"),
+        Line::from("  :rename <name>       Rename current room (owner only)"),
+        Line::from("  :delete              Delete current room (owner only)"),
+        Line::from("  :transfer <user>     Transfer ownership (owner only)"),
         Line::from(""),
         Line::from("MAIN MENU").style(Style::default().add_modifier(Modifier::BOLD)),
         Line::from("  c                    Create a new room"),
