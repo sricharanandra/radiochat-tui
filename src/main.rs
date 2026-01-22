@@ -342,6 +342,12 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                     app.is_focused = false;
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    // Global Ctrl+C handler
+                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                        app.should_quit = true;
+                        continue;
+                    }
+
                     // Handle command mode input
                     if app.command_input.is_some() {
                         match key.code {
@@ -707,27 +713,44 @@ async fn handle_room_creation_screen(
     key: event::KeyEvent,
     _ws_tx: mpsc::UnboundedSender<String>,
 ) {
-    if let KeyCode::Enter = key.code {
-        if let Some(room_name) = &app.room_name {
-            // Join the room we just created using joinRoom message
-            if let Some(ws_sender) = &app.ws_sender {
-                let join_payload = JoinRoomPayload {
-                    room_id: None,
-                    room_name: Some(room_name),
-                };
-                let join_message = ClientMessage {
-                    message_type: "joinRoom",
-                    payload: join_payload,
-                };
-                if let Ok(json) = serde_json::to_string(&join_message) {
-                    if ws_sender.send(json).is_ok() {
-                        app.messages.clear();
-                        app.current_screen = CurrentScreen::InRoom;
-                        app.status_message = format!("Joined room: #{}", room_name);
+    match key.code {
+        KeyCode::Enter => {
+            if let Some(room_name) = &app.room_name {
+                // Join the room we just created using joinRoom message
+                if let Some(ws_sender) = &app.ws_sender {
+                    let join_payload = JoinRoomPayload {
+                        room_id: None,
+                        room_name: Some(room_name),
+                    };
+                    let join_message = ClientMessage {
+                        message_type: "joinRoom",
+                        payload: join_payload,
+                    };
+                    if let Ok(json) = serde_json::to_string(&join_message) {
+                        if ws_sender.send(json).is_ok() {
+                            app.messages.clear();
+                            app.current_screen = CurrentScreen::InRoom;
+                            app.status_message = format!("Joined room: #{}", room_name);
+                        }
                     }
                 }
+            } else {
+                // If no room was created (e.g. error), Enter should just go back
+                app.current_screen = CurrentScreen::RoomChoice;
+                app.status_message = "Create or Join a secure room.".to_string();
             }
         }
+        KeyCode::Esc => {
+            // Go back to main menu
+            app.current_screen = CurrentScreen::RoomChoice;
+            app.status_message = "Create or Join a secure room.".to_string();
+        }
+        KeyCode::Char('q') => {
+             // Go back to main menu
+            app.current_screen = CurrentScreen::RoomChoice;
+            app.status_message = "Create or Join a secure room.".to_string();
+        }
+        _ => {}
     }
 }
 
