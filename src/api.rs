@@ -39,6 +39,17 @@ pub struct TypingPayload<'a> {
     pub room_id: &'a str,
 }
 
+#[derive(Serialize)]
+pub struct CreateInvitePayload<'a> {
+    #[serde(rename = "roomId")]
+    pub room_id: &'a str,
+}
+
+#[derive(Serialize)]
+pub struct JoinViaInvitePayload<'a> {
+    pub code: &'a str,
+}
+
 // Generic wrapper for all client-sent messages
 #[derive(Serialize)]
 pub struct ClientMessage<'a, T> {
@@ -162,6 +173,18 @@ pub struct UserTypingPayload {
     pub user_id: String,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+pub struct InviteCreatedPayload {
+    pub code: String,
+    #[serde(rename = "roomId")]
+    #[allow(dead_code)]
+    pub room_id: String,
+    #[serde(rename = "roomName")]
+    pub room_name: String,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: String,
+}
+
 // Enum to represent all possible incoming server messages
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "payload")]
@@ -176,4 +199,5 @@ pub enum ServerMessage {
     Info(InfoPayload),
     Error(ErrorPayload),
     UserTyping(UserTypingPayload),
+    InviteCreated(InviteCreatedPayload),
 }

@@ -9,7 +9,7 @@ use crate::crypto::{decrypt, encrypt, AesKey};
 use crate::clipboard::ClipboardManager;
 use crate::config::Config;
 use crate::vim::{VimMode, VimState};
-use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo, TypingPayload};
+use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo, TypingPayload, CreateInvitePayload, JoinViaInvitePayload};
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
     crossterm::{
@@ -1292,6 +1292,48 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                 app.status_message = "Select SSH key to use for registration".to_string();
             }
         }
+        // Share/Invite command
+        "share" | "invite" => {
+            if app.current_screen == CurrentScreen::InRoom {
+                if let Some(room_id) = &app.room_id {
+                    if let Some(ws_sender) = &app.ws_sender {
+                        let payload = CreateInvitePayload {
+                            room_id,
+                        };
+                        let msg = ClientMessage {
+                            message_type: "createInvite",
+                            payload,
+                        };
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            let _ = ws_sender.send(json);
+                            app.status_message = "Generating invite code...".to_string();
+                        }
+                    }
+                }
+            } else {
+                app.status_message = ":share only works inside a room".to_string();
+            }
+        }
+        // Join via invite code
+        "join" | "j" => {
+            if let Some(code) = parts.get(1) {
+                if let Some(ws_sender) = &app.ws_sender {
+                    let payload = JoinViaInvitePayload {
+                        code,
+                    };
+                    let msg = ClientMessage {
+                        message_type: "joinViaInvite",
+                        payload,
+                    };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        let _ = ws_sender.send(json);
+                        app.status_message = format!("Joining via invite code {}...", code);
+                    }
+                }
+            } else {
+                app.status_message = "Usage: :join <code>".to_string();
+            }
+        }
         // Unknown command
         "" => {
             // Empty command, do nothing
@@ -1439,6 +1481,29 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
         ServerMessage::UserTyping(payload) => {
             // Add user to typing list with current timestamp
             app.typing_users.insert(payload.username.clone(), std::time::Instant::now());
+        }
+        ServerMessage::InviteCreated(payload) => {
+            app.messages.push(ChatMessage::system(format!(
+                "Invite code generated: {}",
+                payload.code
+            )));
+            app.messages.push(ChatMessage::system(
+                "Share this code with others to let them join this room.".to_string(),
+            ));
+            app.messages.push(ChatMessage::system(
+                "This code expires in 24 hours.".to_string(),
+            ));
+            app.message_scroll_offset = 0;
+            
+            // Try to copy to clipboard
+            if let Some(clipboard) = &mut app.clipboard {
+                match clipboard.copy_text(&payload.code) {
+                    Ok(_) => app.status_message = format!("Invite code {} copied to clipboard!", payload.code),
+                    Err(_) => app.status_message = format!("Invite code: {}", payload.code),
+                }
+            } else {
+                app.status_message = format!("Invite code: {}", payload.code);
+            }
         }
     }
 }
@@ -2231,6 +2296,8 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  :register, :reg      Start registration flow"),
         Line::from("  :list, :l            Show room switcher (in room)"),
         Line::from("  :switch <room>, :s   Switch to room by name"),
+        Line::from("  :share, :invite      Generate invite code for current room"),
+        Line::from("  :join <code>, :j     Join room using invite code"),
         Line::from(""),
         Line::from("MAIN MENU").style(Style::default().add_modifier(Modifier::BOLD)),
         Line::from("  c                    Create a new room"),
