@@ -1601,7 +1601,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    let title = Paragraph::new("RadioChat :: E2EE")
+    let title = Paragraph::new("radiochat - private messaging")
         .style(Style::default().fg(Color::LightCyan))
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
@@ -1634,7 +1634,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
 fn render_room_choice(f: &mut Frame, area: Rect) {
     let text = Text::from(vec![
-        Line::from("Welcome to RadioChat - E2EE Chat"),
+        Line::from("Welcome to radiochat - secure private messaging"),
         Line::from(""),
         Line::from("Press 'c' to CREATE a new room"),
         Line::from("Press 'j' to JOIN / browse rooms"),
@@ -1901,7 +1901,7 @@ fn render_registration_error(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("No SSH keys found!").style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
         Line::from(""),
-        Line::from("RadioChat requires an SSH key for authentication."),
+        Line::from("radiochat requires an SSH key for authentication."),
         Line::from(""),
         Line::from("To create one, run:"),
         Line::from("  ssh-keygen -t ed25519").style(Style::default().fg(Color::Cyan)),
@@ -2010,7 +2010,7 @@ fn render_registration_success(f: &mut Frame, app: &App, area: Rect) {
         Line::from(format!("Token: {}", token_display)).style(Style::default().fg(Color::DarkGray)),
         Line::from(""),
         Line::from(""),
-        Line::from("Press Enter to continue to RadioChat"),
+        Line::from("Press Enter to continue to radiochat"),
     ]);
     
     let paragraph = Paragraph::new(text)
@@ -2024,7 +2024,7 @@ fn render_registration_success(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_help(f: &mut Frame, area: Rect) {
     let text = Text::from(vec![
-        Line::from("RadioChat Help").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Line::from("radiochat Help").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Line::from(""),
         Line::from("COMMANDS").style(Style::default().add_modifier(Modifier::BOLD)),
         Line::from("  :q, :quit, :leave    Quit app or leave room"),
