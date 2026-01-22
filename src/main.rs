@@ -51,6 +51,40 @@ enum CurrentlyEditing {
     RoomName,
 }
 
+/// A chat message with content and timestamp
+#[derive(Clone)]
+struct ChatMessage {
+    content: String,      // Formatted message like "[user] text"
+    timestamp: String,    // Formatted time like "2:34 PM"
+}
+
+impl ChatMessage {
+    fn new(content: String, timestamp: Option<String>) -> Self {
+        let formatted_time = if let Some(ts) = timestamp {
+            // Parse ISO timestamp and format as local time
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&ts) {
+                dt.with_timezone(&chrono::Local).format("%I:%M %p").to_string()
+            } else {
+                chrono::Local::now().format("%I:%M %p").to_string()
+            }
+        } else {
+            chrono::Local::now().format("%I:%M %p").to_string()
+        };
+        
+        Self {
+            content,
+            timestamp: formatted_time,
+        }
+    }
+    
+    fn system(content: String) -> Self {
+        Self {
+            content,
+            timestamp: chrono::Local::now().format("%I:%M %p").to_string(),
+        }
+    }
+}
+
 struct App<'a> {
     // Inputs
     room_name_input: TextArea<'a>,
@@ -68,7 +102,7 @@ struct App<'a> {
     room_id: Option<String>,
     room_name: Option<String>,
     room_key: Option<AesKey>,
-    messages: Vec<String>,
+    messages: Vec<ChatMessage>,
     
     // Room List
     public_rooms: Vec<RoomInfo>,
@@ -228,7 +262,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
         if let Ok(text) = ws_incoming_rx.try_recv() {
             // Check for disconnect signal
             if text == "__DISCONNECT__" {
-                app.messages.push("[SYSTEM] Connection lost. Attempting to reconnect...".to_string());
+                app.messages.push(ChatMessage::system("[SYSTEM] Connection lost. Attempting to reconnect...".to_string()));
                 app.ws_sender = None;
                 
                 // Attempt reconnection in background
@@ -251,10 +285,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                                         let _ = sender.send(json);
                                     }
                                 }
-                                app.messages.push("[SYSTEM] Reconnected successfully!".to_string());
+                                app.messages.push(ChatMessage::system("[SYSTEM] Reconnected successfully!".to_string()));
                             }
                             Err(_) => {
-                                app.messages.push("[SYSTEM] Failed to reconnect. Please restart.".to_string());
+                                app.messages.push(ChatMessage::system("[SYSTEM] Failed to reconnect. Please restart.".to_string()));
                             }
                         }
                     }
@@ -264,7 +298,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                     Ok(server_msg) => handle_server_message(app, server_msg),
                     Err(_) => {
                         // Raw info messages from the server
-                        app.messages.push(format!("[SERVER] {}", text));
+                        app.messages.push(ChatMessage::system(format!("[SERVER] {}", text)));
                     }
                 };
             }
@@ -1232,23 +1266,23 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
                 match decrypt(key, &payload.ciphertext) {
                     Ok(plaintext) => {
                         let formatted = format!("[{}] {}", payload.username, plaintext);
-                        app.messages.push(formatted);
+                        app.messages.push(ChatMessage::new(formatted, Some(payload.timestamp.clone())));
                         app.message_scroll_offset = 0; // Auto-scroll to bottom
                     }
                     Err(_) => app
                         .messages
-                        .push("[DECRYPTION_ERROR] Received invalid message".to_string()),
+                        .push(ChatMessage::system("[DECRYPTION_ERROR] Received invalid message".to_string())),
                 }
             }
         }
         ServerMessage::UserJoined(payload) => {
             app.messages
-                .push(format!("→ {} joined the room", payload.username));
+                .push(ChatMessage::system(format!("→ {} joined the room", payload.username)));
             app.message_scroll_offset = 0; // Auto-scroll to bottom
         }
         ServerMessage::UserLeft(payload) => {
             app.messages
-                .push(format!("← {} left the room", payload.username));
+                .push(ChatMessage::system(format!("← {} left the room", payload.username)));
             app.message_scroll_offset = 0; // Auto-scroll to bottom
         }
         ServerMessage::RoomJoined(payload) => {
@@ -1276,11 +1310,11 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
                     match decrypt(key, &msg.ciphertext) {
                         Ok(plaintext) => {
                             let formatted = format!("[{}] {}", msg.username, plaintext);
-                            app.messages.push(formatted);
+                            app.messages.push(ChatMessage::new(formatted, Some(msg.timestamp.clone())));
                         }
                         Err(_) => app
                             .messages
-                            .push("[DECRYPTION_ERROR] Could not decrypt old message".to_string()),
+                            .push(ChatMessage::system("[DECRYPTION_ERROR] Could not decrypt old message".to_string())),
                     }
                 }
             }
@@ -1301,9 +1335,9 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             }
             
             app.messages = vec![
-                format!("Room {} created successfully!", payload.display_name),
-                "".to_string(),
-                "Press Enter to join the room".to_string(),
+                ChatMessage::system(format!("Room {} created successfully!", payload.display_name)),
+                ChatMessage::system("".to_string()),
+                ChatMessage::system("Press Enter to join the room".to_string()),
             ];
         }
         ServerMessage::RoomsList(payload) => {
@@ -1317,11 +1351,11 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             );
         }
         ServerMessage::Info(payload) => {
-            app.messages.push(format!("[SERVER] {}", payload.message));
+            app.messages.push(ChatMessage::system(format!("[SERVER] {}", payload.message)));
         }
         ServerMessage::Error(payload) => {
             app.status_message = format!("[ERROR] {}", payload.message);
-            app.messages.push(format!("[ERROR] {}", payload.message));
+            app.messages.push(ChatMessage::system(format!("[ERROR] {}", payload.message)));
         }
     }
 }
@@ -1742,7 +1776,7 @@ fn render_create_room_input(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_room_creation(f: &mut Frame, app: &mut App, area: Rect) {
-    let text: Vec<Line> = app.messages.iter().map(|s| Line::from(s.clone())).collect();
+    let text: Vec<Line> = app.messages.iter().map(|m| Line::from(m.content.clone())).collect();
     let widget = Paragraph::new(Text::from(text))
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true })
@@ -1763,9 +1797,24 @@ fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
     // Calculate visible height (subtract 2 for borders)
     let visible_height = chunks[0].height.saturating_sub(2) as usize;
     let total_messages = app.messages.len();
+    let available_width = chunks[0].width.saturating_sub(2) as usize; // subtract borders
     
-    // Create text content from messages
-    let text_content: Vec<Line> = app.messages.iter().map(|m| Line::from(m.clone())).collect();
+    // Create text content from messages with right-aligned timestamps
+    let text_content: Vec<Line> = app.messages.iter().map(|msg| {
+        let timestamp = &msg.timestamp;
+        let content = &msg.content;
+        
+        // Calculate padding to right-align timestamp
+        let timestamp_len = timestamp.len();
+        let content_len = content.chars().count();
+        let padding_needed = available_width.saturating_sub(content_len + timestamp_len + 2);
+        
+        Line::from(vec![
+            Span::raw(content.clone()),
+            Span::raw(" ".repeat(padding_needed.max(1))),
+            Span::styled(timestamp.clone(), Style::default().fg(Color::DarkGray)),
+        ])
+    }).collect();
     
     // Calculate scroll position to show latest messages at the bottom
     // When offset is 0, we want to see the last messages
