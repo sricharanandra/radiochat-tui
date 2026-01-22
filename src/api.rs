@@ -33,6 +33,12 @@ pub struct ListRoomsPayload {
     // Empty payload
 }
 
+#[derive(Serialize)]
+pub struct TypingPayload<'a> {
+    #[serde(rename = "roomId")]
+    pub room_id: &'a str,
+}
+
 // Generic wrapper for all client-sent messages
 #[derive(Serialize)]
 pub struct ClientMessage<'a, T> {
@@ -138,6 +144,14 @@ pub struct InfoPayload {
     pub message: String,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+pub struct UserTypingPayload {
+    pub username: String,
+    #[serde(rename = "userId")]
+    #[allow(dead_code)]
+    pub user_id: String,
+}
+
 // Enum to represent all possible incoming server messages
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "payload")]
@@ -151,4 +165,5 @@ pub enum ServerMessage {
     RoomsList(RoomsListPayload),
     Info(InfoPayload),
     Error(ErrorPayload),
+    UserTyping(UserTypingPayload),
 }

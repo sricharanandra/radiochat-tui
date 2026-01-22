@@ -9,7 +9,7 @@ use crate::crypto::{decrypt, encrypt, AesKey};
 use crate::clipboard::ClipboardManager;
 use crate::config::Config;
 use crate::vim::{VimMode, VimState};
-use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo};
+use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo, TypingPayload};
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
     crossterm::{
@@ -104,6 +104,10 @@ struct App<'a> {
     room_key: Option<AesKey>,
     messages: Vec<ChatMessage>,
     
+    // Typing indicators (username -> timestamp when they started typing)
+    typing_users: std::collections::HashMap<String, std::time::Instant>,
+    last_typing_sent: Option<std::time::Instant>,
+    
     // Room List
     public_rooms: Vec<RoomInfo>,
     private_rooms: Vec<RoomInfo>,
@@ -169,6 +173,8 @@ impl<'a> Default for App<'a> {
             room_name: None,
             room_key: None,
             messages: Vec::new(),
+            typing_users: std::collections::HashMap::new(),
+            last_typing_sent: None,
             public_rooms: Vec::new(),
             private_rooms: Vec::new(),
             selected_room_index: 0,
@@ -241,6 +247,11 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
 
     loop {
         terminal.draw(|f| ui(f, app))?;
+
+        // Clear expired typing indicators (older than 3 seconds)
+        app.typing_users.retain(|_, timestamp| {
+            timestamp.elapsed() < std::time::Duration::from_secs(3)
+        });
 
         if app.should_quit {
             break;
@@ -1000,10 +1011,15 @@ async fn handle_insert_mode(app: &mut App<'_>, key: event::KeyEvent) {
             app.emoji_partial.clear();
             app.emoji_matches.clear();
             app.emoji_selected_index = 0;
+            send_typing_indicator(app);
         }
         _ => {
             // Pass all other keys to the text input
             app.message_input.input(Event::Key(key));
+            // Send typing indicator (debounced)
+            if matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace) {
+                send_typing_indicator(app);
+            }
         }
     }
 }
@@ -1051,6 +1067,28 @@ async fn send_message(app: &mut App<'_>) {
                     app.status_message = "FATAL: Failed to encrypt message.".to_string();
                 }
             }
+        }
+    }
+}
+
+fn send_typing_indicator(app: &mut App<'_>) {
+    // Debounce: only send typing event every 2 seconds
+    let should_send = match app.last_typing_sent {
+        Some(last) => last.elapsed() > std::time::Duration::from_secs(2),
+        None => true,
+    };
+    
+    if should_send {
+        if let (Some(sender), Some(room_id)) = (&app.ws_sender, &app.room_id) {
+            let payload = TypingPayload { room_id };
+            let msg = ClientMessage {
+                message_type: "typing",
+                payload,
+            };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                let _ = sender.send(json);
+            }
+            app.last_typing_sent = Some(std::time::Instant::now());
         }
     }
 }
@@ -1356,6 +1394,10 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
         ServerMessage::Error(payload) => {
             app.status_message = format!("[ERROR] {}", payload.message);
             app.messages.push(ChatMessage::system(format!("[ERROR] {}", payload.message)));
+        }
+        ServerMessage::UserTyping(payload) => {
+            // Add user to typing list with current timestamp
+            app.typing_users.insert(payload.username.clone(), std::time::Instant::now());
         }
     }
 }
@@ -1796,11 +1838,10 @@ fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Calculate visible height (subtract 2 for borders)
     let visible_height = chunks[0].height.saturating_sub(2) as usize;
-    let total_messages = app.messages.len();
     let available_width = chunks[0].width.saturating_sub(2) as usize; // subtract borders
     
     // Create text content from messages with right-aligned timestamps
-    let text_content: Vec<Line> = app.messages.iter().map(|msg| {
+    let mut text_content: Vec<Line> = app.messages.iter().map(|msg| {
         let timestamp = &msg.timestamp;
         let content = &msg.content;
         
@@ -1816,11 +1857,29 @@ fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
         ])
     }).collect();
     
+    // Add typing indicator if anyone is typing
+    if !app.typing_users.is_empty() {
+        let typing_names: Vec<&String> = app.typing_users.keys().collect();
+        let typing_text = if typing_names.len() == 1 {
+            format!("{} is typing...", typing_names[0])
+        } else if typing_names.len() == 2 {
+            format!("{} and {} are typing...", typing_names[0], typing_names[1])
+        } else {
+            format!("{} people are typing...", typing_names.len())
+        };
+        text_content.push(Line::from(Span::styled(
+            typing_text,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
+        )));
+    }
+    
+    let total_lines = text_content.len();
+    
     // Calculate scroll position to show latest messages at the bottom
     // When offset is 0, we want to see the last messages
     // scroll_y = total_lines - visible_height (to show bottom)
-    let scroll_y = if total_messages > visible_height {
-        (total_messages - visible_height).saturating_sub(app.message_scroll_offset)
+    let scroll_y = if total_lines > visible_height {
+        (total_lines - visible_height).saturating_sub(app.message_scroll_offset)
     } else {
         0
     };
