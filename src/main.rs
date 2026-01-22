@@ -13,7 +13,7 @@ use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, S
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
     crossterm::{
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind},
+        event::{self, DisableMouseCapture, EnableMouseCapture, EnableFocusChange, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind},
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tui_textarea::TextArea;
+use notify_rust::Notification;
 
 // --- Application State ---
 
@@ -97,6 +98,7 @@ struct App<'a> {
     should_quit: bool,
     vim_state: VimState,
     message_scroll_offset: usize,
+    current_username: Option<String>,
 
     // Room Data
     room_id: Option<String>,
@@ -111,6 +113,7 @@ struct App<'a> {
     
     // UI State
     show_user_list: bool,  // Show user list overlay
+    is_focused: bool,      // Is terminal focused?
     
     // Room List
     public_rooms: Vec<RoomInfo>,
@@ -173,6 +176,7 @@ impl<'a> Default for App<'a> {
             currently_editing: None,
             status_message: "Create or Join a secure room.".to_string(),
             should_quit: false,
+            current_username: None,
             room_id: None,
             room_name: None,
             room_key: None,
@@ -181,6 +185,7 @@ impl<'a> Default for App<'a> {
             typing_users: std::collections::HashMap::new(),
             last_typing_sent: None,
             show_user_list: false,
+            is_focused: true, // Assume focused initially
             public_rooms: Vec::new(),
             private_rooms: Vec::new(),
             selected_room_index: 0,
@@ -229,7 +234,12 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
     let (ws_incoming_tx, mut ws_incoming_rx) = mpsc::unbounded_channel::<String>();
 
     // Check if user is registered (has auth token)
-    let token_exists = load_auth_token(&app.config.auth.token_path).is_some();
+    let token = load_auth_token(&app.config.auth.token_path);
+    let token_exists = token.is_some();
+    
+    if let Some(t) = &token {
+        app.current_username = extract_username_from_token(t);
+    }
     
     if !token_exists {
         // No token found - need to register
@@ -325,6 +335,12 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
         if event::poll(std::time::Duration::from_millis(50))? {
             let event = event::read()?;
             match event {
+                Event::FocusGained => {
+                    app.is_focused = true;
+                }
+                Event::FocusLost => {
+                    app.is_focused = false;
+                }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // Handle command mode input
                     if app.command_input.is_some() {
@@ -462,6 +478,7 @@ async fn handle_username_input_screen(app: &mut App<'_>, key: event::KeyEvent) {
                         if let Err(e) = save_auth_token(&token) {
                             app.registration_error = Some(format!("Failed to save token: {}", e));
                         }
+                        app.current_username = extract_username_from_token(&token);
                         app.registration_token = Some(token);
                         app.current_screen = CurrentScreen::RegistrationSuccess;
                         app.status_message = "Registration successful!".to_string();
@@ -1474,6 +1491,15 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
                         let formatted = format!("[{}] {}", payload.username, plaintext);
                         app.messages.push(ChatMessage::new(formatted, Some(payload.timestamp.clone())));
                         app.message_scroll_offset = 0; // Auto-scroll to bottom
+
+                        // Desktop Notification
+                        if !app.is_focused && Some(&payload.username) != app.current_username.as_ref() {
+                            let _ = Notification::new()
+                                .summary(&format!("New message from {}", payload.username))
+                                .body("You have a new encrypted message")
+                                .appname("radiochat")
+                                .show();
+                        }
                     }
                     Err(_) => app
                         .messages
@@ -1635,6 +1661,39 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             )));
         }
     }
+}
+
+fn extract_username_from_token(token: &str) -> Option<String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    
+    // JWT payload is the second part
+    // Add padding if needed
+    let payload_b64 = parts[1];
+    let padding = match payload_b64.len() % 4 {
+        2 => "==",
+        3 => "=",
+        _ => "",
+    };
+    let payload_padded = format!("{}{}", payload_b64, padding);
+    
+    use base64::{Engine as _, engine::general_purpose};
+    if let Ok(decoded) = general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) 
+        .or_else(|_| general_purpose::STANDARD.decode(&payload_padded)) 
+    {
+        if let Ok(json_str) = String::from_utf8(decoded) {
+            #[derive(serde::Deserialize)]
+            struct JwtPayload {
+                username: String,
+            }
+            if let Ok(payload) = serde_json::from_str::<JwtPayload>(&json_str) {
+                return Some(payload.username);
+            }
+        }
+    }
+    None
 }
 
 fn load_auth_token(token_path: &str) -> Option<String> {
@@ -2490,7 +2549,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>, Box<dyn Error>> {
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableFocusChange)?;
     enable_raw_mode()?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
