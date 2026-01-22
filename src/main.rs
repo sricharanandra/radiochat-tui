@@ -342,12 +342,6 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                     app.is_focused = false;
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    // Global Ctrl+C handler
-                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                        app.should_quit = true;
-                        continue;
-                    }
-
                     // Handle command mode input
                     if app.command_input.is_some() {
                         match key.code {
@@ -423,6 +417,9 @@ async fn handle_registration_screen(app: &mut App<'_>, key: event::KeyEvent) {
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
             app.should_quit = true;
         }
+        KeyCode::Char(':') => {
+            app.command_input = Some(String::new());
+        }
         KeyCode::Char('r') | KeyCode::Char('R') => {
             // Retry scanning for keys
             app.available_keys = scan_ssh_keys();
@@ -454,6 +451,9 @@ async fn handle_key_selection_screen(app: &mut App<'_>, key: event::KeyEvent) {
             // Proceed to username input
             app.current_screen = CurrentScreen::UsernameInput;
             app.status_message = "Enter your desired username".to_string();
+        }
+        KeyCode::Char(':') => {
+            app.command_input = Some(String::new());
         }
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
             app.should_quit = true;
@@ -500,6 +500,9 @@ async fn handle_username_input_screen(app: &mut App<'_>, key: event::KeyEvent) {
             app.current_screen = CurrentScreen::KeySelection;
             app.status_message = "Select SSH key to use for registration".to_string();
         }
+        KeyCode::Char(':') => {
+            app.command_input = Some(String::new());
+        }
         _ => {
             app.username_input.input(Event::Key(key));
         }
@@ -512,6 +515,9 @@ async fn handle_registration_success_screen(app: &mut App<'_>, key: event::KeyEv
             // Continue to main app
             app.current_screen = CurrentScreen::RoomChoice;
             app.status_message = "Create or Join a secure room.".to_string();
+        }
+        KeyCode::Char(':') => {
+            app.command_input = Some(String::new());
         }
         _ => {}
     }
@@ -702,6 +708,9 @@ async fn handle_create_room_input_screen(
         KeyCode::Esc => {
             app.current_screen = CurrentScreen::RoomChoice;
         }
+        KeyCode::Char(':') => {
+            app.command_input = Some(String::new());
+        }
         _ => {
             app.room_name_input.input(key);
         }
@@ -749,6 +758,9 @@ async fn handle_room_creation_screen(
              // Go back to main menu
             app.current_screen = CurrentScreen::RoomChoice;
             app.status_message = "Create or Join a secure room.".to_string();
+        }
+        KeyCode::Char(':') => {
+            app.command_input = Some(String::new());
         }
         _ => {}
     }
@@ -1189,6 +1201,9 @@ async fn handle_room_switcher_screen(app: &mut App<'_>, key: event::KeyEvent) {
                 app.status_message = format!("Switching to #{}", room_name);
             }
         }
+        KeyCode::Char(':') => {
+            app.command_input = Some(String::new());
+        }
         _ => {}
     }
 }
@@ -1205,6 +1220,9 @@ fn handle_help_screen(app: &mut App, key: event::KeyEvent) {
                 app.status_message = "Create or Join a secure room.".to_string();
             }
         }
+        KeyCode::Char(':') => {
+            app.command_input = Some(String::new());
+        }
         _ => {}
     }
 }
@@ -1217,10 +1235,6 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
     let command = parts.first().map(|s| *s).unwrap_or("");
     
     match command {
-        // Force quit - exit app from anywhere
-        "qq" | "qa" | "quit!" => {
-            app.should_quit = true;
-        }
         // Quit commands
         "q" | "quit" | "leave" => {
             match app.current_screen {
@@ -1235,11 +1249,20 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                     app.current_screen = CurrentScreen::RoomChoice;
                     app.status_message = "Left room. Press C to create or J to join.".to_string();
                 }
-                _ => {
+                CurrentScreen::RoomChoice => {
                     // Quit application
                     app.should_quit = true;
                 }
+                _ => {
+                    // For all other screens (menus, inputs, etc.), go back to Main Menu
+                    app.current_screen = CurrentScreen::RoomChoice;
+                    app.status_message = "Create or Join a secure room.".to_string();
+                }
             }
+        }
+        // Force quit
+        "qq" | "qa" | "quit!" => {
+            app.should_quit = true;
         }
         // Help command
         "h" | "help" => {
