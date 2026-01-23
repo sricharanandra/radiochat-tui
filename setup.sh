@@ -1,5 +1,5 @@
 #!/bin/bash
-# RadioChat TUI Client Setup Script
+# Eurus TUI Client Setup Script
 # Usage: ./setup.sh <username> <jwt-token>
 
 set -e
@@ -13,19 +13,19 @@ fi
 USERNAME="$1"
 JWT_TOKEN="$2"
 
-echo "🚀 Setting up RadioChat for user: $USERNAME"
+echo "🚀 Setting up Eurus for user: $USERNAME"
 
 # Create config directory
-mkdir -p ~/.config/radiochat
+mkdir -p ~/.config/eurus
 echo "✅ Created config directory"
 
 # Create config file
-cat > ~/.config/radiochat/config.toml << EOF
+cat > ~/.config/eurus/config.toml << EOF
 [server]
-url = "wss://radiochat.sreus.tech/ws"
+url = "wss://eurus.sreus.tech/ws"
 
 [auth]
-token_path = "~/.config/radiochat/token"
+token_path = "~/.config/eurus/token"
 
 [ui]
 show_timestamps = true
@@ -39,19 +39,19 @@ EOF
 echo "✅ Created config file"
 
 # Save JWT token
-echo "$JWT_TOKEN" > ~/.config/radiochat/token
-chmod 600 ~/.config/radiochat/token
+echo "$JWT_TOKEN" > ~/.config/eurus/token
+chmod 600 ~/.config/eurus/token
 echo "✅ Saved authentication token"
 
 echo ""
 echo "🎉 Setup complete!"
 echo ""
-echo "To start RadioChat:"
+echo "To start Eurus:"
 echo "  cargo run --release"
 echo ""
 echo "Or build once and run the binary:"
 echo "  cargo build --release"
-echo "  ./target/release/radiochat"
+echo "  ./target/release/eurus"
 echo ""
 echo "Controls:"
 echo "  • Vim keybindings: hjkl, i/a/o for insert, Esc for normal mode"

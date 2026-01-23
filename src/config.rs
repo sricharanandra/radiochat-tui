@@ -41,12 +41,11 @@ pub struct NetworkConfig {
 }
 
 fn default_server_url() -> String {
-    std::env::var("RADIOCHAT_SERVER_URL")
-        .unwrap_or_else(|_| "wss://radiochat.sreus.tech/ws".to_string())
+    std::env::var("EURUS_SERVER_URL").unwrap_or_else(|_| "wss://eurus.sreus.tech/ws".to_string())
 }
 
 fn default_token_path() -> String {
-    "~/.config/radiochat/token".to_string()
+    "~/.config/eurus/token".to_string()
 }
 
 fn default_true() -> bool {
@@ -101,14 +100,14 @@ impl Config {
                 }
             }
         }
-        
+
         // Fall back to defaults
         Self::default()
     }
-    
+
     pub fn config_path() -> Option<PathBuf> {
         dirs::config_dir().map(|mut path| {
-            path.push("radiochat");
+            path.push("eurus");
             path.push("config.toml");
             path
         })

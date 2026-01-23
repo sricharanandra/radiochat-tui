@@ -858,6 +858,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
+name = "eurus"
+version = "0.1.0"
+dependencies = [
+ "aead",
+ "aes-gcm",
+ "arboard",
+ "base64",
+ "chrono",
+ "crossterm 0.27.0",
+ "dirs",
+ "futures-util",
+ "hex",
+ "image",
+ "notify-rust",
+ "rand 0.8.5",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "toml",
+ "tui-textarea",
+]
+
+[[package]]
 name = "event-listener"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2209,32 +2235,6 @@ name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
-
-[[package]]
-name = "radiochat"
-version = "0.1.0"
-dependencies = [
- "aead",
- "aes-gcm",
- "arboard",
- "base64",
- "chrono",
- "crossterm 0.27.0",
- "dirs",
- "futures-util",
- "hex",
- "image",
- "notify-rust",
- "rand 0.8.5",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "toml",
- "tui-textarea",
-]
 
 [[package]]
 name = "rand"
