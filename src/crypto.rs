@@ -13,6 +13,16 @@ pub fn generate_key() -> AesKey {
     Aes256Gcm::generate_key(OsRng)
 }
 
+/// Decodes a hex-encoded key string into an AesKey.
+/// Returns None if the hex is invalid or not exactly 32 bytes.
+pub fn key_from_hex(hex_key: &str) -> Option<AesKey> {
+    let bytes = hex::decode(hex_key).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    Some(*AesKey::from_slice(&bytes))
+}
+
 /// Encrypts the given plaintext using AES-256-GCM.
 ///
 /// The process is:

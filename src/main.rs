@@ -5,7 +5,7 @@ mod config;
 mod vim;
 mod emoji;
 
-use crate::crypto::{decrypt, encrypt, AesKey};
+use crate::crypto::{decrypt, encrypt, key_from_hex, AesKey};
 use crate::clipboard::ClipboardManager;
 use crate::config::Config;
 use crate::vim::{VimMode, VimState};
@@ -1589,11 +1589,10 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             
             // Store the room key from the server
             if !payload.encrypted_key.is_empty() {
-                if let Some(user_key) = &app.config.auth.token_path.rsplit('/').next() { // Wait, this logic for key loading needs checking, but assuming existing logic works for now.
-                    // Actually key derivation is handled elsewhere or via SSH agent signing challenges.
-                    // For now just storing the key if it was decrypted or provided.
-                    // The actual decryption logic is likely in establish_connection or similar.
-                    // Let's stick to simple renames.
+                if let Some(key) = key_from_hex(&payload.encrypted_key) {
+                    app.room_key = Some(key);
+                } else {
+                    app.status_message = "Error: Failed to decode room key".to_string();
                 }
             }
             
@@ -1626,7 +1625,16 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             app.room_display_name = Some(payload.display_name.clone());
             
             // Store the room key from the server
-            // ...
+            if !payload.encrypted_key.is_empty() {
+                if let Some(key) = key_from_hex(&payload.encrypted_key) {
+                    app.room_key = Some(key);
+                } else {
+                    app.status_message = "Error: Failed to decode room key".to_string();
+                }
+            }
+            
+            // Switch to room view
+            app.current_screen = CurrentScreen::InRoom;
         }
         ServerMessage::RoomsList(payload) => {
             app.public_rooms = payload.public_rooms;
