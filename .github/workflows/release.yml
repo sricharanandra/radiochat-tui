@@ -17,20 +17,20 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            artifact_name: radiochat
-            asset_name: radiochat-linux-amd64
+            artifact_name: eurus
+            asset_name: eurus-linux-amd64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: radiochat.exe
-            asset_name: radiochat-windows-amd64.exe
+            artifact_name: eurus.exe
+            asset_name: eurus-windows-amd64.exe
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: radiochat
-            asset_name: radiochat-macos-amd64
+            artifact_name: eurus
+            asset_name: eurus-macos-amd64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: radiochat
-            asset_name: radiochat-macos-arm64
+            artifact_name: eurus
+            asset_name: eurus-macos-arm64
 
     steps:
       - uses: actions/checkout@v4
