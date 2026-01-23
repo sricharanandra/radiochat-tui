@@ -318,12 +318,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                             }
                             Err(_) => {
                                 app.messages.push(ChatMessage::system("[SYSTEM] Failed to reconnect. Please restart.".to_string()));
-            }
-        } else {
-            app.status_message = "Error: Not connected to a room or missing encryption key.".to_string();
-        }
-    }
-}
+                            }
+                        }
+                    }
+                }
             } else {
                 match serde_json::from_str::<ServerMessage>(&text) {
                     Ok(server_msg) => handle_server_message(app, server_msg),
@@ -1138,6 +1136,8 @@ async fn send_message(app: &mut App<'_>) {
                     app.status_message = "FATAL: Failed to encrypt message.".to_string();
                 }
             }
+        } else {
+            app.status_message = "Error: Not connected to a room or missing encryption key.".to_string();
         }
     }
 }
