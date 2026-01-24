@@ -4,12 +4,14 @@ mod clipboard;
 mod config;
 mod vim;
 mod emoji;
+mod voice;
 
 use crate::crypto::{decrypt, encrypt, key_from_hex, AesKey};
 use crate::clipboard::ClipboardManager;
 use crate::config::Config;
 use crate::vim::{VimMode, VimState};
-use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo, TypingPayload, CreateInvitePayload, JoinViaInvitePayload, RenameRoomPayload, DeleteRoomPayload, TransferOwnershipPayload, CreateDMPayload};
+use crate::voice::manager::{VoiceManager, VoiceEvent};
+use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo, TypingPayload, CreateInvitePayload, JoinViaInvitePayload, RenameRoomPayload, DeleteRoomPayload, TransferOwnershipPayload, CreateDMPayload, VoiceSignalPayload};
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
     crossterm::{
@@ -172,9 +174,14 @@ struct App<'a> {
     
     // Emoji Picker
     emoji_picker_active: bool,
-    emoji_matches: Vec<(&'static str, &'static str, &'static str)>, // (shortcode, emoji, description)
+    emoji_partial: String,
+    emoji_matches: Vec<(&'static str, &'static str, &'static str)>,
     emoji_selected_index: usize,
-    emoji_partial: String,  // The partial shortcode being typed (without the leading :)
+
+    // Voice Chat
+    voice_tx: Option<mpsc::UnboundedSender<voice::manager::VoiceCommand>>,
+    voice_active: bool,
+    voice_users: Vec<String>,
 }
 
 impl<'a> Default for App<'a> {
@@ -235,10 +242,14 @@ impl<'a> Default for App<'a> {
             },
             registration_token: None,
             registration_error: None,
+            
             emoji_picker_active: false,
             emoji_matches: Vec::new(),
             emoji_selected_index: 0,
             emoji_partial: String::new(),
+            voice_tx: None,
+            voice_active: false,
+            voice_users: Vec::new(),
         }
     }
 }
@@ -256,6 +267,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> io::Result<()> {
     let (ws_incoming_tx, mut ws_incoming_rx) = mpsc::unbounded_channel::<String>();
+
+    // Setup Voice Manager
+    let (voice_cmd_tx, voice_cmd_rx) = mpsc::unbounded_channel::<voice::manager::VoiceCommand>();
+    let (voice_event_tx, mut voice_event_rx) = mpsc::unbounded_channel::<voice::manager::VoiceEvent>();
+    app.voice_tx = Some(voice_cmd_tx);
+    
+    // Spawn Voice Manager Task
+    tokio::spawn(async move {
+        let mut manager = VoiceManager::new(voice_event_tx);
+        manager.run(voice_cmd_rx).await;
+    });
 
     // Check if user is registered (has auth token)
     let token = load_auth_token(&app.config.auth.token_path);
@@ -352,6 +374,38 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                         app.messages.push(ChatMessage::system(format!("[SERVER] {}", text)));
                     }
                 };
+            }
+        }
+
+        // Handle Voice Events
+        if let Ok(event) = voice_event_rx.try_recv() {
+            match event {
+                VoiceEvent::Signal { target_id, signal_type, data } => {
+                    // Send this signal to the server via WebSocket
+                    if let (Some(ws_sender), Some(room_id)) = (&app.ws_sender, &app.room_id) {
+                        let payload = VoiceSignalPayload {
+                            room_id: room_id.clone(),
+                            target_user_id: target_id,
+                            sender_user_id: None, // Server fills this
+                            sender_username: None,
+                            signal_type,
+                            data,
+                        };
+                        let msg = ClientMessage {
+                            message_type: "voiceSignal",
+                            payload,
+                        };
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            let _ = ws_sender.send(json);
+                        }
+                    }
+                }
+                VoiceEvent::StatusUpdate(msg) => {
+                    app.status_message = format!("VOICE: {}", msg);
+                }
+                VoiceEvent::Error(e) => {
+                    app.status_message = format!("VOICE ERROR: {}", e);
+                }
             }
         }
 
@@ -1266,6 +1320,12 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
             match app.current_screen {
                 CurrentScreen::InRoom => {
                     // Leave room, return to main menu
+                    if let Some(voice_tx) = &app.voice_tx {
+                        let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
+                    }
+                    app.voice_active = false;
+                    app.voice_users.clear();
+                    
                     app.room_id = None;
                     app.room_name = None;
                     app.room_key = None;
@@ -1519,6 +1579,65 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                 app.status_message = "Usage: :dm <username>".to_string();
             }
         }
+        // Voice Chat
+        "vc" => {
+            if app.current_screen == CurrentScreen::InRoom {
+                if let Some(room_id) = &app.room_id {
+                    let subcmd = parts.get(1).map(|s| *s).unwrap_or("");
+                    if let Some(voice_tx) = &app.voice_tx {
+                        match subcmd {
+                            "join" | "" => {
+                                if app.voice_active && app.voice_users.contains(&app.current_username.clone().unwrap_or_default()) {
+                                    app.status_message = "Already in voice chat.".to_string();
+                                } else {
+                                    let _ = voice_tx.send(voice::manager::VoiceCommand::Join(room_id.clone()));
+                                    app.status_message = "Joining voice...".to_string();
+                                }
+                            }
+                            "leave" | "l" => {
+                                let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
+                                app.status_message = "Leaving voice...".to_string();
+                            }
+                            "mute" | "m" => {
+                                let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(true));
+                                app.status_message = "Microphone muted.".to_string();
+                            }
+                            "unmute" | "um" => {
+                                let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(false));
+                                app.status_message = "Microphone unmuted.".to_string();
+                            }
+                            _ => {
+                                app.status_message = "Usage: :vc [join|leave|mute|unmute]".to_string();
+                            }
+                        }
+                    } else {
+                        app.status_message = "Voice Chat not initialized.".to_string();
+                    }
+                }
+            } else {
+                app.status_message = ":vc only works inside a room".to_string();
+            }
+        }
+        // Aliases
+        "m" | "mute" => {
+            if let Some(voice_tx) = &app.voice_tx {
+                let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(true));
+                app.status_message = "Microphone muted.".to_string();
+            }
+        }
+        "um" | "unmute" => {
+            if let Some(voice_tx) = &app.voice_tx {
+                let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(false));
+                app.status_message = "Microphone unmuted.".to_string();
+            }
+        }
+        "vcl" => {
+            if let Some(voice_tx) = &app.voice_tx {
+                let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
+                app.status_message = "Leaving voice...".to_string();
+            }
+        }
+        
         // Unknown command
         "" => {
             // Empty command, do nothing
@@ -1735,6 +1854,24 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
                 "Room ownership transferred to {}",
                 payload.new_owner_username
             )));
+        }
+        ServerMessage::VoiceSignal(payload) => {
+            if let Some(voice_tx) = &app.voice_tx {
+                if let (Some(sender_id), Some(_sender_username)) = (payload.sender_user_id, payload.sender_username) {
+                    let _ = voice_tx.send(voice::manager::VoiceCommand::Signal {
+                        sender_id,
+                        signal_type: payload.signal_type,
+                        data: payload.data,
+                    });
+                }
+            }
+        }
+        ServerMessage::VoiceState(payload) => {
+            if Some(payload.room_id) == app.room_id {
+                app.voice_users = payload.active_users;
+                app.voice_active = !app.voice_users.is_empty();
+                // TODO: Show notification if focused
+            }
         }
     }
 }
@@ -2075,15 +2212,37 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(header, chunks[0]);
 
     // --- Body Rendering ---
-    // Calculate the floating input area RECT
-    // Centered, max width 100 chars, or 90% of screen
-    let input_width = 100.min((f.area().width as f32 * 0.9) as u16);
-    let input_height = 4; // 3 lines for input + 1 for border/padding effect
     
-    // Position it at the bottom, just above the status line
-    // y = height - footer(1) - input_height
-    let input_y = f.area().height.saturating_sub(input_height + 1);
-    let input_x = (f.area().width.saturating_sub(input_width)) / 2;
+    // Split the body into Sidebar (Voice) and Main Chat area
+    // Sidebar visible only in InRoom (or always? Let's do always for consistency, or active room)
+    // For now, only InRoom makes sense.
+    
+    let (sidebar_area, main_area) = if app.current_screen == CurrentScreen::InRoom {
+        let body_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(25), // Voice Sidebar
+                Constraint::Min(1),     // Main Content
+            ])
+            .split(chunks[1]);
+        (Some(body_layout[0]), body_layout[1])
+    } else {
+        (None, chunks[1])
+    };
+
+    // Calculate the floating input area RECT relative to MAIN AREA
+    // Centered in main_area, max width 100 chars, or 90% of main_area
+    let input_width = 100.min((main_area.width as f32 * 0.95) as u16); // 95% of remaining space
+    let input_height = 4; 
+    
+    let input_y = main_area.y + main_area.height.saturating_sub(input_height); // Bottom of main_area (chunks[1])
+    // Wait, chunks[1] does NOT include the footer padding (chunks[2]).
+    // But we want it to float *above* the footer.
+    // chunks[1] is "Min(1)". chunks[2] is "Length(3)".
+    // So main_area.y + main_area.height IS the top of the footer.
+    // So we want y = (main_area.y + main_area.height) - input_height.
+    
+    let input_x = main_area.x + (main_area.width.saturating_sub(input_width)) / 2;
     
     let floating_input_area = Rect {
         x: input_x,
@@ -2092,26 +2251,30 @@ fn ui(f: &mut Frame, app: &mut App) {
         height: input_height,
     };
 
+    // Render Voice Sidebar if active
+    if let Some(area) = sidebar_area {
+        render_voice_sidebar(f, app, area);
+    }
+
     match app.current_screen {
         // Registration screens
-        CurrentScreen::Registration => render_registration_error(f, chunks[1]),
-        CurrentScreen::KeySelection => render_key_selection(f, app, chunks[1]),
-        CurrentScreen::UsernameInput => render_username_input(f, app, chunks[1]),
-        CurrentScreen::RegistrationSuccess => render_registration_success(f, app, chunks[1]),
+        CurrentScreen::Registration => render_registration_error(f, main_area),
+        CurrentScreen::KeySelection => render_key_selection(f, app, main_area),
+        CurrentScreen::UsernameInput => render_username_input(f, app, main_area),
+        CurrentScreen::RegistrationSuccess => render_registration_success(f, app, main_area),
         
         // Main screens
-        CurrentScreen::RoomChoice => render_room_choice(f, chunks[1]),
-        CurrentScreen::RoomList => render_room_list(f, app, chunks[1]),
-        CurrentScreen::RoomTypeSelection => render_room_type_selection(f, app, chunks[1]),
-        CurrentScreen::CreateRoomInput => render_create_room_input(f, app, chunks[1]),
-        CurrentScreen::RoomCreation => render_room_creation(f, app, chunks[1]),
-        CurrentScreen::InRoom => render_in_room(f, app, chunks[1], floating_input_area), // Pass floating area
+        CurrentScreen::RoomChoice => render_room_choice(f, main_area),
+        CurrentScreen::RoomList => render_room_list(f, app, main_area),
+        CurrentScreen::RoomTypeSelection => render_room_type_selection(f, app, main_area),
+        CurrentScreen::CreateRoomInput => render_create_room_input(f, app, main_area),
+        CurrentScreen::RoomCreation => render_room_creation(f, app, main_area),
+        CurrentScreen::InRoom => render_in_room(f, app, main_area, floating_input_area), 
         CurrentScreen::RoomSwitcher => {
-            // Render room in background, then overlay
-            render_in_room(f, app, chunks[1], floating_input_area);
-            render_room_switcher_overlay(f, app, chunks[1]);
+            render_in_room(f, app, main_area, floating_input_area);
+            render_room_switcher_overlay(f, app, main_area);
         }
-        CurrentScreen::Help => render_help(f, chunks[1]),
+        CurrentScreen::Help => render_help(f, main_area),
     }
 
     // Render footer status at the very bottom line
@@ -2515,6 +2678,31 @@ fn render_user_list_overlay(f: &mut Frame, app: &App, area: Rect) {
         );
     
     f.render_widget(list, overlay_area);
+}
+
+fn render_voice_sidebar(f: &mut Frame, app: &App, area: Rect) {
+    // Only render if there are voice users or I am in voice
+    if app.voice_users.is_empty() {
+        return;
+    }
+    
+    let items: Vec<ListItem> = app.voice_users.iter().map(|u| {
+        let style = if Some(u) == app.current_username.as_ref() {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        ListItem::new(format!("🔊 {}", u)).style(style)
+    }).collect();
+    
+    let list = List::new(items)
+        .block(Block::default()
+            .borders(Borders::RIGHT) // Separator line
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" Voice ")
+            .title_style(Style::default().fg(Color::Green)));
+            
+    f.render_widget(list, area);
 }
 
 fn render_emoji_picker(f: &mut Frame, app: &App, input_area: Rect) {

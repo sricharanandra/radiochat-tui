@@ -78,6 +78,21 @@ pub struct CreateDMPayload<'a> {
     pub target_username: &'a str,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VoiceSignalPayload {
+    #[serde(rename = "roomId")]
+    pub room_id: String,
+    #[serde(rename = "targetUserId", skip_serializing_if = "Option::is_none")]
+    pub target_user_id: Option<String>,
+    #[serde(rename = "senderUserId", skip_serializing_if = "Option::is_none")]
+    pub sender_user_id: Option<String>,
+    #[serde(rename = "senderUsername", skip_serializing_if = "Option::is_none")]
+    pub sender_username: Option<String>,
+    #[serde(rename = "type")]
+    pub signal_type: String,
+    pub data: String,
+}
+
 // Generic wrapper for all client-sent messages
 #[derive(Serialize)]
 pub struct ClientMessage<'a, T> {
@@ -242,6 +257,14 @@ pub struct OwnershipTransferredPayload {
     pub new_owner_id: String,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+pub struct VoiceStatePayload {
+    #[serde(rename = "roomId")]
+    pub room_id: String,
+    #[serde(rename = "activeUsers")]
+    pub active_users: Vec<String>,
+}
+
 // Enum to represent all possible incoming server messages
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "payload")]
@@ -260,4 +283,6 @@ pub enum ServerMessage {
     RoomRenamed(RoomRenamedPayload),
     RoomDeleted(RoomDeletedPayload),
     OwnershipTransferred(OwnershipTransferredPayload),
+    VoiceSignal(VoiceSignalPayload),
+    VoiceState(VoiceStatePayload),
 }
