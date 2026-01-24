@@ -2257,22 +2257,26 @@ fn render_room_creation(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_in_room(f: &mut Frame, app: &mut App, chat_area: Rect, input_area: Rect) {
     // --- Message Area ---
-    // Align chat messages with the floating input box
+    // The chat column should align with the input box horizontally.
+    // Vertically, it should start at the top of chat_area and END above the input_area.
+    
+    // Calculate available height above input box
+    let chat_height = input_area.y.saturating_sub(chat_area.y).saturating_sub(1); // 1 line gap
+    
     let aligned_chat_area = Rect {
         x: input_area.x,
         y: chat_area.y,
         width: input_area.width,
-        height: chat_area.height,
+        height: chat_height,
     };
     
     // Apply background color to the chat column
-    // Chat Column: Dark Gray (Rgb 25, 25, 25)
     let chat_bg_color = Color::Rgb(25, 25, 25);
     
     // Create a block with padding to fix the "text touching edges" issue
     let chat_block = Block::default()
         .style(Style::default().bg(chat_bg_color))
-        .padding(ratatui::widgets::Padding::horizontal(2)); // Add padding inside the gray area
+        .padding(ratatui::widgets::Padding::horizontal(2)); 
         
     f.render_widget(chat_block.clone(), aligned_chat_area);
 
@@ -2311,13 +2315,12 @@ fn render_in_room(f: &mut Frame, app: &mut App, chat_area: Rect, input_area: Rec
             let is_consecutive = last_sender.as_ref() == msg.sender.as_ref();
             
             if !is_consecutive {
-                // Render User Header: > Username ... Time
+                // Render User Header: [Username] ... [Time]
                 let sender_name = msg.sender.as_deref().unwrap_or("Unknown");
                 let timestamp = &msg.timestamp;
                 let prefix = " > ";
                 
                 // Calculate space between name and timestamp
-                // inner_width - (prefix + name + timestamp)
                 let content_len = prefix.len() + sender_name.len() + timestamp.len();
                 let spacer_len = inner_width.saturating_sub(content_len);
                 
@@ -2336,11 +2339,51 @@ fn render_in_room(f: &mut Frame, app: &mut App, chat_area: Rect, input_area: Rec
             }
             
             // Render content 
-            // Add padding to align with the name (prefix len is 3 chars " > ")
-            text_content.push(Line::from(vec![
-                Span::styled("   ", Style::default().bg(chat_bg_color)), // Indent to align with name
-                Span::styled(msg.content.clone(), Style::default().bg(chat_bg_color)),
-            ]));
+            // Manual wrapping logic to preserve indentation on wrapped lines
+            let content = &msg.content;
+            let available_width = inner_width.saturating_sub(3); // 3 spaces indentation
+            
+            if available_width > 0 {
+                // Simple wrapping logic (char based for simplicity in TUI context, or could split by words)
+                // Ideally use textwrap crate but we don't have it.
+                // We'll iterate chars.
+                let mut current_line = String::new();
+                let mut current_width = 0;
+                
+                for word in content.split_whitespace() {
+                    let word_len = word.chars().count();
+                    
+                    if current_width + word_len + (if current_width > 0 { 1 } else { 0 }) > available_width {
+                        // Flush current line
+                        text_content.push(Line::from(vec![
+                            Span::styled("   ", Style::default().bg(chat_bg_color)), 
+                            Span::styled(current_line.clone(), Style::default().bg(chat_bg_color)),
+                        ]));
+                        current_line.clear();
+                        current_width = 0;
+                    }
+                    
+                    if current_width > 0 {
+                        current_line.push(' ');
+                        current_width += 1;
+                    }
+                    current_line.push_str(word);
+                    current_width += word_len;
+                }
+                // Flush remaining
+                if !current_line.is_empty() {
+                    text_content.push(Line::from(vec![
+                        Span::styled("   ", Style::default().bg(chat_bg_color)), 
+                        Span::styled(current_line, Style::default().bg(chat_bg_color)),
+                    ]));
+                }
+            } else {
+                // Fallback if width is too small
+                text_content.push(Line::from(vec![
+                    Span::styled("   ", Style::default().bg(chat_bg_color)), 
+                    Span::styled(content.clone(), Style::default().bg(chat_bg_color)),
+                ]));
+            }
         }
     }
 
@@ -2359,11 +2402,25 @@ fn render_in_room(f: &mut Frame, app: &mut App, chat_area: Rect, input_area: Rec
         ]));
     }
     
-    // Calculate scroll
+    // Calculate scroll based on VISUAL lines (accounting for wrapping)
     let visible_height = inner_area.height as usize;
-    let total_lines = text_content.len();
-    let scroll_y = if total_lines > visible_height {
-        (total_lines - visible_height).saturating_sub(app.message_scroll_offset)
+    
+    // Calculate total wrapped lines
+    let mut total_visual_lines = 0;
+    for line in &text_content {
+        let content_len = line.width(); // Get visual width of the line content
+        if content_len == 0 {
+            total_visual_lines += 1; // Empty line still takes 1 row
+        } else {
+            // How many rows does this line take when wrapped at inner_width?
+            // Use rounding up division: (len + width - 1) / width
+            let rows = (content_len + inner_width - 1) / inner_width;
+            total_visual_lines += rows.max(1);
+        }
+    }
+    
+    let scroll_y = if total_visual_lines > visible_height {
+        (total_visual_lines - visible_height).saturating_sub(app.message_scroll_offset)
     } else {
         0
     };
