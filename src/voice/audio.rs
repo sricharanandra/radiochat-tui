@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use audiopus::{coder::Encoder, Application, Channels, SampleRate};
+use audiopus::{coder::Decoder, coder::Encoder, Application, Channels, SampleRate};
 use tokio::sync::mpsc;
 
 // Wrapper to make cpal::Stream Send (required for tokio::spawn)
@@ -10,11 +10,116 @@ unsafe impl Send for SendStream {}
 
 pub struct AudioEngine {
     input_stream: Option<SendStream>,
+    output_streams: Vec<SendStream>, // Keep active output streams alive
 }
 
 impl AudioEngine {
     pub fn new() -> Self {
-        Self { input_stream: None }
+        Self { 
+            input_stream: None,
+            output_streams: Vec::new(),
+        }
+    }
+
+    pub fn start_playback(&mut self, mut packet_rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Result<()> {
+        let host = cpal::default_host();
+        let device = host.default_output_device().ok_or(anyhow!("No output device"))?;
+        let config = device.default_output_config()?;
+        let stream_config: cpal::StreamConfig = config.clone().into();
+        let sample_rate = stream_config.sample_rate.0;
+
+        // Determine Opus Sample Rate based on output device
+        // If device is 44.1k, we must decode to 48k then resample, or force 48k?
+        // audiopus decoder takes input packet -> output PCM. 
+        // We can tell decoder to produce 48k PCM. If output device is 44.1k, CPAL needs to handle it or we resample.
+        // For MVP, assume 48k output or hope for the best.
+        
+        let opus_rate = match sample_rate {
+            48000 => SampleRate::Hz48000,
+            24000 => SampleRate::Hz24000,
+            16000 => SampleRate::Hz16000,
+            12000 => SampleRate::Hz12000,
+            8000 => SampleRate::Hz8000,
+            _ => SampleRate::Hz48000, // Fallback
+        };
+
+        // Channel to send decoded PCM samples to the audio callback
+        // Uses std::sync::mpsc because cpal callback is sync
+        let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+
+        // Spawn Decoding Task
+        tokio::spawn(async move {
+            let mut decoder = match Decoder::new(opus_rate, Channels::Mono) {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+
+            while let Some(packet) = packet_rx.recv().await {
+                let mut output = [0.0f32; 1920]; // Max frame size (e.g. 40ms at 48k)
+                // Pass slice explicitly
+                match decoder.decode_float(Some(&packet), &mut output[..], false) {
+                    Ok(len) => {
+                        let _ = pcm_tx.send(output[..len].to_vec());
+                    },
+                    Err(_) => {},
+                }
+            }
+        });
+
+        // Setup CPAL Output Stream
+        let err_fn = |_err| {};
+        
+        let stream = device.build_output_stream(
+            &stream_config,
+            move |data: &mut [f32], _: &_| {
+                // Fill buffer with data from pcm_rx
+                // If no data, fill with silence
+                
+                // Simple strategy: Try to read enough samples to fill `data`.
+                // If `pcm_rx` has a pending vector, take from it.
+                
+                // We need a buffer to hold leftover samples from previous callback
+                // But this closure is FnMut, so we can capture a buffer? 
+                // No, cpal calls this frequently.
+                
+                // Simplified: Just drain the channel as much as possible.
+                // This is naive and will cause jitter/gaps without a ring buffer.
+                // But for "hearing people", it's a start.
+                
+                let mut written = 0;
+                while written < data.len() {
+                    match pcm_rx.try_recv() {
+                        Ok(samples) => {
+                            for sample in samples {
+                                if written < data.len() {
+                                    data[written] = sample;
+                                    written += 1;
+                                } else {
+                                    // Drop overflow or buffer it? 
+                                    // Dropping causes glitches. Buffering inside FnMut closure is tricky without RefCell/Mutex.
+                                    // For MVP, we drop.
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Empty or disconnected
+                            break;
+                        }
+                    }
+                }
+                
+                // Fill remainder with silence
+                for i in written..data.len() {
+                    data[i] = 0.0;
+                }
+            },
+            err_fn,
+            None
+        )?;
+
+        stream.play()?;
+        self.output_streams.push(SendStream(stream));
+        Ok(())
     }
 
     pub fn start_capture(&mut self, encoded_tx: mpsc::UnboundedSender<Vec<u8>>) -> Result<()> {

@@ -176,11 +176,23 @@ impl VoiceManager {
         }));
 
         // Handle Incoming Tracks (Remote Audio)
-        // For MVP we just log "Got Track". Playback is harder (needs cpal output stream per track)
-        pc.on_track(Box::new(|_track, _, _| {
+        let audio_engine_clone = self.audio_engine.clone();
+        pc.on_track(Box::new(move |track, _, _| {
+            let audio_engine = audio_engine_clone.clone();
             Box::pin(async move {
-                // println!("Got remote track: {:?}", track.kind());
-                // TODO: Pipe this track to an output stream (AudioEngine)
+                let (packet_tx, packet_rx) = mpsc::unbounded_channel();
+                
+                // Start playback thread for this track
+                {
+                    let mut engine = audio_engine.lock().await;
+                    // Ignore errors for now (e.g. no output device)
+                    let _ = engine.start_playback(packet_rx);
+                }
+
+                // Loop reading RTP packets
+                while let Ok((rtp, _attr)) = track.read_rtp().await {
+                    let _ = packet_tx.send(rtp.payload.to_vec());
+                }
             })
         }));
 
