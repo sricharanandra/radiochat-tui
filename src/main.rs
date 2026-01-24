@@ -55,33 +55,55 @@ enum CurrentlyEditing {
 /// A chat message with content and timestamp
 #[derive(Clone)]
 struct ChatMessage {
-    content: String,      // Formatted message like "[user] text"
+    content: String,      // The actual text content
+    sender: Option<String>, // Username of sender (None for system messages)
     timestamp: String,    // Formatted time like "2:34 PM"
+    date: String,         // Formatted date like "January 24, 2026"
+    is_system: bool,      // Whether it is a system message
 }
 
 impl ChatMessage {
-    fn new(content: String, timestamp: Option<String>) -> Self {
-        let formatted_time = if let Some(ts) = timestamp {
-            // Parse ISO timestamp and format as local time
+    fn new(content: String, sender: Option<String>, timestamp: Option<String>) -> Self {
+        let (formatted_time, formatted_date) = if let Some(ts) = timestamp {
+            // Parse ISO timestamp and format as local time and date
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&ts) {
-                dt.with_timezone(&chrono::Local).format("%I:%M %p").to_string()
+                let local_dt = dt.with_timezone(&chrono::Local);
+                (
+                    local_dt.format("%I:%M %p").to_string(),
+                    local_dt.format("%B %d, %Y").to_string()
+                )
             } else {
-                chrono::Local::now().format("%I:%M %p").to_string()
+                let now = chrono::Local::now();
+                (
+                    now.format("%I:%M %p").to_string(),
+                    now.format("%B %d, %Y").to_string()
+                )
             }
         } else {
-            chrono::Local::now().format("%I:%M %p").to_string()
+            let now = chrono::Local::now();
+            (
+                now.format("%I:%M %p").to_string(),
+                now.format("%B %d, %Y").to_string()
+            )
         };
         
         Self {
             content,
+            sender,
             timestamp: formatted_time,
+            date: formatted_date,
+            is_system: false,
         }
     }
     
     fn system(content: String) -> Self {
+        let now = chrono::Local::now();
         Self {
             content,
-            timestamp: chrono::Local::now().format("%I:%M %p").to_string(),
+            sender: None,
+            timestamp: now.format("%I:%M %p").to_string(),
+            date: now.format("%B %d, %Y").to_string(),
+            is_system: true,
         }
     }
 }
@@ -1065,7 +1087,7 @@ async fn handle_insert_mode(app: &mut App<'_>, key: event::KeyEvent) {
         }
         KeyCode::Enter => {
             // Shift+Enter inserts a newline, plain Enter sends the message
-            if key.modifiers.contains(event::KeyModifiers::SHIFT) {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
                 // Insert newline for multi-line messages
                 app.message_input.insert_newline();
             } else {
@@ -1538,8 +1560,7 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             if let Some(key) = &app.room_key {
                 match decrypt(key, &payload.ciphertext) {
                     Ok(plaintext) => {
-                        let formatted = format!("[{}] {}", payload.username, plaintext);
-                        app.messages.push(ChatMessage::new(formatted, Some(payload.timestamp.clone())));
+                        app.messages.push(ChatMessage::new(plaintext, Some(payload.username.clone()), Some(payload.timestamp.clone())));
                         app.message_scroll_offset = 0; // Auto-scroll to bottom
 
                         // Desktop Notification
@@ -1601,11 +1622,11 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             for msg in payload.messages {
                 if let Some(key) = &app.room_key {
                     if let Ok(plaintext) = decrypt(key, &msg.ciphertext) {
-                        let formatted = format!("[{}] {}", msg.username, plaintext);
-                        app.messages.push(ChatMessage::new(formatted, Some(msg.timestamp)));
+                        app.messages.push(ChatMessage::new(plaintext, Some(msg.username), Some(msg.timestamp)));
                     } else {
                         app.messages.push(ChatMessage::new(
-                            format!("[{}] <Encrypted Message>", msg.username),
+                            "<Encrypted Message>".to_string(),
+                            Some(msg.username),
                             Some(msg.timestamp),
                         ));
                     }
@@ -2018,20 +2039,58 @@ async fn try_connect(
 // --- UI Rendering ---
 
 fn ui(f: &mut Frame, app: &mut App) {
+    // Force the entire background to be Pure Black (RGB 0,0,0) to override terminal theme palette
+    let background_block = Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0)));
+    f.render_widget(background_block, f.area());
+
+    // Layout: Header (1), Chat (Min 1), Status/Padding (3)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Title
+            Constraint::Length(1), // Header
             Constraint::Min(1),    // Main content
-            Constraint::Length(3), // Footer
+            Constraint::Length(3), // Footer padding (where status + floating input will sit)
         ])
         .split(f.area());
 
-    let title = Paragraph::new("eurus - private messaging")
-        .style(Style::default().fg(Color::LightCyan))
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL));
-    f.render_widget(title, chunks[0]);
+    // --- Header Rendering ---
+    let header_text = match app.current_screen {
+        CurrentScreen::InRoom => {
+            let room_name = app.room_display_name.as_deref().unwrap_or("Unknown");
+            Line::from(vec![
+                Span::styled(" eurus ", Style::default().bg(Color::Blue).fg(Color::Black).add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+                Span::styled(format!(" {} ", room_name), Style::default().bg(Color::DarkGray).fg(Color::White)),
+                Span::raw(" "),
+                Span::styled(format!(" {} online ", app.online_users.len()), Style::default().fg(Color::Gray)),
+            ])
+        },
+        _ => Line::from(vec![
+            Span::styled(" eurus ", Style::default().bg(Color::Blue).fg(Color::Black).add_modifier(Modifier::BOLD)),
+            Span::raw(" - private messaging"),
+        ]),
+    };
+
+    let header = Paragraph::new(header_text).style(Style::default().bg(Color::Rgb(0, 0, 0)));
+    f.render_widget(header, chunks[0]);
+
+    // --- Body Rendering ---
+    // Calculate the floating input area RECT
+    // Centered, max width 100 chars, or 90% of screen
+    let input_width = 100.min((f.area().width as f32 * 0.9) as u16);
+    let input_height = 4; // 3 lines for input + 1 for border/padding effect
+    
+    // Position it at the bottom, just above the status line
+    // y = height - footer(1) - input_height
+    let input_y = f.area().height.saturating_sub(input_height + 1);
+    let input_x = (f.area().width.saturating_sub(input_width)) / 2;
+    
+    let floating_input_area = Rect {
+        x: input_x,
+        y: input_y,
+        width: input_width,
+        height: input_height,
+    };
 
     match app.current_screen {
         // Registration screens
@@ -2046,33 +2105,46 @@ fn ui(f: &mut Frame, app: &mut App) {
         CurrentScreen::RoomTypeSelection => render_room_type_selection(f, app, chunks[1]),
         CurrentScreen::CreateRoomInput => render_create_room_input(f, app, chunks[1]),
         CurrentScreen::RoomCreation => render_room_creation(f, app, chunks[1]),
-        CurrentScreen::InRoom => render_in_room(f, app, chunks[1]),
+        CurrentScreen::InRoom => render_in_room(f, app, chunks[1], floating_input_area), // Pass floating area
         CurrentScreen::RoomSwitcher => {
             // Render room in background, then overlay
-            render_in_room(f, app, chunks[1]);
+            render_in_room(f, app, chunks[1], floating_input_area);
             render_room_switcher_overlay(f, app, chunks[1]);
         }
         CurrentScreen::Help => render_help(f, chunks[1]),
     }
 
-    render_footer(f, app, chunks[2]);
+    // Render footer status at the very bottom line
+    // Use the last line of the screen
+    let footer_area = Rect {
+        x: 0,
+        y: f.area().height.saturating_sub(1),
+        width: f.area().width,
+        height: 1,
+    };
+    render_footer(f, app, footer_area);
 }
 
 fn render_room_choice(f: &mut Frame, area: Rect) {
+    // Add some padding
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(2), Constraint::Percentage(100), Constraint::Min(2)])
+        .split(area);
+        
     let text = Text::from(vec![
-        Line::from("Welcome to eurus - secure private messaging"),
         Line::from(""),
-        Line::from("Press 'c' to CREATE a new room"),
-        Line::from("Press 'j' to JOIN / browse rooms"),
+        Line::from("Welcome to eurus").style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
         Line::from(""),
-        Line::from("Press ':' or 'Ctrl+C' to quit"),
+        Line::from("  c   Create new room"),
+        Line::from("  j   Join / browse rooms"),
+        Line::from(""),
+        Line::from("  :   Command mode"),
+        Line::from(""),
     ]);
-    let widget = Paragraph::new(text).alignment(Alignment::Center).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Choose an Action"),
-    );
-    f.render_widget(widget, area);
+    
+    let widget = Paragraph::new(text).alignment(Alignment::Left);
+    f.render_widget(widget, chunks[1]);
 }
 
 fn render_room_list(f: &mut Frame, app: &App, area: Rect) {
@@ -2084,17 +2156,35 @@ fn render_room_list(f: &mut Frame, app: &App, area: Rect) {
     
     let room_type = if app.viewing_private { "PRIVATE" } else { "PUBLIC" };
     
+    // Custom header for the list
+    let header_text = format!("{} ROOMS (Tab to switch)", room_type);
+    
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(area);
+        
+    f.render_widget(
+        Paragraph::new(header_text).style(Style::default().add_modifier(Modifier::BOLD)), 
+        chunks[0]
+    );
+    
     let items: Vec<ListItem> = rooms_to_display
         .iter()
         .enumerate()
         .map(|(i, room)| {
             let style = if i == app.selected_room_index {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
+                Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
+            
+            // Simple indicator
+            let cursor = if i == app.selected_room_index { ">" } else { " " };
+            
             let content = format!(
-                "{} ({} members)",
+                "{} {:<20} ({} users)",
+                cursor,
                 room.display_name,
                 room.member_count
             );
@@ -2102,14 +2192,8 @@ fn render_room_list(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("{} Rooms - Use ↑↓ to navigate, Enter to join, Tab to switch, R to refresh, Esc to go back", room_type))
-        );
-    
-    f.render_widget(list, area);
+    let list = List::new(items);
+    f.render_widget(list, chunks[1]);
 }
 
 fn render_room_type_selection(f: &mut Frame, app: &App, area: Rect) {
@@ -2125,89 +2209,142 @@ fn render_room_type_selection(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::Gray)
     };
     
-    let public_marker = if !app.selected_room_type { "> " } else { "  " };
-    let private_marker = if app.selected_room_type { "> " } else { "  " };
+    let public_marker = if !app.selected_room_type { "●" } else { "○" };
+    let private_marker = if app.selected_room_type { "●" } else { "○" };
     
     let text = Text::from(vec![
-        Line::from("Select Room Type"),
+        Line::from(""),
+        Line::from("Select Room Type").style(Style::default().add_modifier(Modifier::BOLD)),
         Line::from(""),
         Line::from(vec![
-            Span::raw(public_marker),
-            Span::styled("Public", public_style),
-            Span::raw("  - Anyone can discover and join"),
+            Span::styled(format!("  {} Public  ", public_marker), public_style),
+            Span::raw("Anyone can join"),
         ]),
         Line::from(vec![
-            Span::raw(private_marker),
-            Span::styled("Private", private_style),
-            Span::raw(" - Only visible to members"),
+            Span::styled(format!("  {} Private ", private_marker), private_style),
+            Span::raw("Invite only"),
         ]),
         Line::from(""),
-        Line::from(""),
-        Line::from("[Tab] Switch type  [Enter] Continue  [Esc] Cancel"),
+        Line::from("Tab to switch • Enter to confirm"),
     ]);
     
-    let paragraph = Paragraph::new(text)
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).title("Create Room"));
+    let paragraph = Paragraph::new(text).alignment(Alignment::Left);
     f.render_widget(paragraph, area);
 }
 
 fn render_create_room_input(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(1)])
-        .margin(2)
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(area);
     
-    f.render_widget(&app.room_name_input, chunks[0]);
+    let help_text = Paragraph::new("Enter room name:")
+        .style(Style::default().fg(Color::Cyan));
+    f.render_widget(help_text, chunks[0]);
     
-    let help_text = Paragraph::new("Enter a room name (e.g., 'general', 'team-chat')\nPress Enter to create, Esc to cancel")
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).title("Help"));
-    f.render_widget(help_text, chunks[1]);
+    // Render input without block
+    app.room_name_input.set_block(Block::default());
+    f.render_widget(&app.room_name_input, chunks[1]);
 }
 
 fn render_room_creation(f: &mut Frame, app: &mut App, area: Rect) {
     let text: Vec<Line> = app.messages.iter().map(|m| Line::from(m.content.clone())).collect();
     let widget = Paragraph::new(Text::from(text))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Room Credentials"),
-        );
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: true });
     f.render_widget(widget, area);
 }
 
-fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
-        .split(area);
+fn render_in_room(f: &mut Frame, app: &mut App, chat_area: Rect, input_area: Rect) {
+    // --- Message Area ---
+    // Align chat messages with the floating input box
+    let aligned_chat_area = Rect {
+        x: input_area.x,
+        y: chat_area.y,
+        width: input_area.width,
+        height: chat_area.height,
+    };
+    
+    // Apply background color to the chat column
+    // Chat Column: Dark Gray (Rgb 25, 25, 25)
+    let chat_bg_color = Color::Rgb(25, 25, 25);
+    
+    // Create a block with padding to fix the "text touching edges" issue
+    let chat_block = Block::default()
+        .style(Style::default().bg(chat_bg_color))
+        .padding(ratatui::widgets::Padding::horizontal(2)); // Add padding inside the gray area
+        
+    f.render_widget(chat_block.clone(), aligned_chat_area);
 
-    // Calculate visible height (subtract 2 for borders)
-    let visible_height = chunks[0].height.saturating_sub(2) as usize;
-    let available_width = chunks[0].width.saturating_sub(2) as usize; // subtract borders
-    
-    // Create text content from messages with right-aligned timestamps
-    let mut text_content: Vec<Line> = app.messages.iter().map(|msg| {
-        let timestamp = &msg.timestamp;
-        let content = &msg.content;
-        
-        // Calculate padding to right-align timestamp
-        let timestamp_len = timestamp.len();
-        let content_len = content.chars().count();
-        let padding_needed = available_width.saturating_sub(content_len + timestamp_len + 2);
-        
-        Line::from(vec![
-            Span::raw(content.clone()),
-            Span::raw(" ".repeat(padding_needed.max(1))),
-            Span::styled(timestamp.clone(), Style::default().fg(Color::DarkGray)),
-        ])
-    }).collect();
-    
-    // Add typing indicator if anyone is typing
+    // Calculate inner area after padding
+    let inner_area = chat_block.inner(aligned_chat_area);
+    let inner_width = inner_area.width as usize;
+
+    let mut text_content: Vec<Line> = Vec::new();
+    let mut last_sender: Option<String> = None;
+    let mut last_date: Option<String> = None;
+
+    for msg in &app.messages {
+        // Date Separator
+        if last_date.as_ref() != Some(&msg.date) {
+            let date_str = &msg.date;
+            // Calculate padding based on inner_width
+            let total_padding = inner_width.saturating_sub(date_str.len() + 2);
+            let padding_side = total_padding / 2;
+            
+            let separator = "─".repeat(padding_side);
+            
+            text_content.push(Line::from(vec![
+                Span::styled(format!("{} {} {}", separator, date_str, separator), Style::default().fg(Color::DarkGray).bg(chat_bg_color)),
+            ]));
+            last_date = Some(msg.date.clone());
+            last_sender = None; // Reset sender on new date
+        }
+
+        if msg.is_system {
+            text_content.push(Line::from(vec![
+                Span::styled(format!("! {}", msg.content), Style::default().fg(Color::Magenta).bg(chat_bg_color)),
+            ]));
+            last_sender = None;
+        } else {
+            // Group consecutive messages
+            let is_consecutive = last_sender.as_ref() == msg.sender.as_ref();
+            
+            if !is_consecutive {
+                // Render User Header: > Username ... Time
+                let sender_name = msg.sender.as_deref().unwrap_or("Unknown");
+                let timestamp = &msg.timestamp;
+                let prefix = " > ";
+                
+                // Calculate space between name and timestamp
+                // inner_width - (prefix + name + timestamp)
+                let content_len = prefix.len() + sender_name.len() + timestamp.len();
+                let spacer_len = inner_width.saturating_sub(content_len);
+                
+                text_content.push(Line::from("")); // Spacing between groups
+                text_content.push(Line::from(vec![
+                    // Prefix Symbol
+                    Span::styled(prefix, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD).bg(chat_bg_color)),
+                    // Username
+                    Span::styled(sender_name, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD).bg(chat_bg_color)),
+                    // Spacer
+                    Span::styled(" ".repeat(spacer_len), Style::default().bg(chat_bg_color)),
+                    // Timestamp
+                    Span::styled(timestamp, Style::default().fg(Color::DarkGray).bg(chat_bg_color)),
+                ]));
+                last_sender = msg.sender.clone();
+            }
+            
+            // Render content 
+            // Add padding to align with the name (prefix len is 3 chars " > ")
+            text_content.push(Line::from(vec![
+                Span::styled("   ", Style::default().bg(chat_bg_color)), // Indent to align with name
+                Span::styled(msg.content.clone(), Style::default().bg(chat_bg_color)),
+            ]));
+        }
+    }
+
+    // Add typing indicator
     if !app.typing_users.is_empty() {
         let typing_names: Vec<&String> = app.typing_users.keys().collect();
         let typing_text = if typing_names.len() == 1 {
@@ -2217,17 +2354,14 @@ fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             format!("{} people are typing...", typing_names.len())
         };
-        text_content.push(Line::from(Span::styled(
-            typing_text,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
-        )));
+        text_content.push(Line::from(vec![
+            Span::styled(typing_text, Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC).bg(chat_bg_color)),
+        ]));
     }
     
+    // Calculate scroll
+    let visible_height = inner_area.height as usize;
     let total_lines = text_content.len();
-    
-    // Calculate scroll position to show latest messages at the bottom
-    // When offset is 0, we want to see the last messages
-    // scroll_y = total_lines - visible_height (to show bottom)
     let scroll_y = if total_lines > visible_height {
         (total_lines - visible_height).saturating_sub(app.message_scroll_offset)
     } else {
@@ -2235,36 +2369,51 @@ fn render_in_room(f: &mut Frame, app: &mut App, area: Rect) {
     };
     
     let messages_paragraph = Paragraph::new(text_content)
-        .block(Block::default().borders(Borders::ALL).title(
-            format!("Room: {}", app.room_display_name.as_deref().unwrap_or("Unknown")),
-        ))
         .wrap(Wrap { trim: false })
         .scroll((scroll_y as u16, 0));
     
-    f.render_widget(messages_paragraph, chunks[0]);
+    // Render text into the padded inner area
+    f.render_widget(messages_paragraph, inner_area);
 
-    // Update message input block to show vim mode
-    let vim_mode_str = app.vim_state.mode.as_str();
-    let title = format!("Message [{}]", vim_mode_str);
-    app.message_input.set_block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(match app.vim_state.mode {
-                VimMode::Normal => Style::default().fg(Color::Cyan),
-                VimMode::Insert => Style::default().fg(Color::Green),
-            })
-    );
-    f.render_widget(&app.message_input, chunks[1]);
+    // --- Input Area ---
+    let vim_mode_str = match app.vim_state.mode {
+        VimMode::Normal => "NORMAL",
+        VimMode::Insert => "INSERT",
+    };
+    
+    // Clear area behind the floating input
+    f.render_widget(Clear, input_area);
+    
+    // Input Box Colors: Lighter Gray (Rgb 45, 45, 45)
+    let input_bg_color = Color::Rgb(45, 45, 45);
+    
+    // Floating Input Block style
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", vim_mode_str))
+        .title_style(Style::default().fg(match app.vim_state.mode {
+            VimMode::Normal => Color::Cyan,
+            VimMode::Insert => Color::Green,
+        }).add_modifier(Modifier::BOLD))
+        .border_style(Style::default().fg(Color::Gray)) // Lighter border
+        .style(Style::default().bg(input_bg_color)); 
+
+    app.message_input.set_block(input_block);
+    app.message_input.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    app.message_input.set_style(Style::default().fg(Color::White).bg(input_bg_color));
+    
+    f.render_widget(&app.message_input, input_area);
+    
+    // Removed "? for help" hint as requested
     
     // Render emoji picker overlay if active
     if app.emoji_picker_active && !app.emoji_matches.is_empty() {
-        render_emoji_picker(f, app, chunks[1]);
+        render_emoji_picker(f, app, input_area);
     }
     
     // Render user list overlay if active
     if app.show_user_list {
-        render_user_list_overlay(f, app, area);
+        render_user_list_overlay(f, app, f.area());
     }
 }
 
@@ -2589,15 +2738,25 @@ fn render_help(f: &mut Frame, area: Rect) {
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     // Show command input if in command mode, otherwise show status message
     let (text, style) = if let Some(ref cmd) = app.command_input {
-        (format!(":{}", cmd), Style::default().fg(Color::Cyan))
+        (format!(":{}", cmd), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
     } else {
-        (app.status_message.clone(), Style::default().fg(Color::Yellow))
+        let status = &app.status_message;
+        
+        // Suppress duplicate mode messages in the footer
+        if status == "-- NORMAL --" || status == "-- INSERT --" {
+            ("".to_string(), Style::default())
+        } else if status.to_lowercase().contains("error") || status.to_lowercase().contains("unknown") {
+            (status.clone(), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        } else {
+            (status.clone(), Style::default().fg(Color::White))
+        }
     };
     
+    // Render without block to keep it minimal
     let footer_text = Paragraph::new(text)
         .style(style)
-        .alignment(Alignment::Left)
-        .block(Block::default().borders(Borders::ALL).title("Status"));
+        .alignment(Alignment::Left);
+        
     f.render_widget(footer_text, area);
 }
 
