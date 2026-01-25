@@ -1890,17 +1890,26 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             )));
         }
         ServerMessage::VoiceSignal(payload) => {
+            eprintln!("[MAIN] Received VoiceSignal: type={}, sender={:?}, voice_active={}", 
+                payload.signal_type, payload.sender_username, app.voice_active);
+            
             if !app.voice_active {
+                eprintln!("[MAIN] Ignoring signal - voice not active");
                 return;
             }
             if let Some(voice_tx) = &app.voice_tx {
                 if let (Some(sender_id), Some(_sender_username)) = (payload.sender_user_id, payload.sender_username) {
+                    eprintln!("[MAIN] Forwarding signal to VoiceManager: type={}, sender_id={}", payload.signal_type, sender_id);
                     let _ = voice_tx.send(voice::manager::VoiceCommand::Signal {
                         sender_id,
                         signal_type: payload.signal_type,
                         data: payload.data,
                     });
+                } else {
+                    eprintln!("[MAIN] Missing sender_id or sender_username in payload");
                 }
+            } else {
+                eprintln!("[MAIN] voice_tx is None");
             }
         }
         ServerMessage::VoiceState(payload) => {

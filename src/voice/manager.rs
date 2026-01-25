@@ -301,16 +301,24 @@ impl VoiceManager {
     }
 
     pub async fn handle_signal(&mut self, sender_id: &str, signal_type: &str, data: &str) -> Result<()> {
+        eprintln!("[VOICE] handle_signal: type={}, sender={}, is_joined={}", 
+            signal_type, sender_id, self.is_joined.load(Ordering::Relaxed));
+        
         match signal_type {
             "join_voice" => {
+                eprintln!("[VOICE] Peer {} joined voice, creating peer connection with offer", sender_id);
                 // Remote user joined, we connect to them (Host/Client logic needed to avoid double connection)
                 // Simplest: Use ID comparison. If my_id < their_id, I initiate.
                 // But I don't have my_id easily here (it's in App).
                 // Alternative: "join_voice" just means "I am here". 
                 // Let's assume the EXISTING users initiate connections to the NEW user.
-                self.create_peer_connection(sender_id.to_string(), true).await?;
+                match self.create_peer_connection(sender_id.to_string(), true).await {
+                    Ok(_) => eprintln!("[VOICE] Peer connection created successfully for {}", sender_id),
+                    Err(e) => eprintln!("[VOICE] Failed to create peer connection for {}: {}", sender_id, e),
+                }
             }
             "offer" => {
+                eprintln!("[VOICE] Received offer from {}", sender_id);
                 let pc = self.create_peer_connection(sender_id.to_string(), false).await?;
                 let desc: RTCSessionDescription = serde_json::from_str(data)?;
                 pc.set_remote_description(desc).await?;
@@ -319,6 +327,7 @@ impl VoiceManager {
                 pc.set_local_description(answer.clone()).await?;
                 
                 if let Ok(json) = serde_json::to_string(&answer) {
+                    eprintln!("[VOICE] Sending answer to {}", sender_id);
                     self.event_tx.send(VoiceEvent::Signal {
                         target_id: Some(sender_id.to_string()),
                         signal_type: "answer".to_string(),
@@ -327,27 +336,39 @@ impl VoiceManager {
                 }
             }
             "answer" => {
+                eprintln!("[VOICE] Received answer from {}", sender_id);
                 let peers = self.peers.lock().await;
                 if let Some(pc) = peers.get(sender_id) {
                     let desc: RTCSessionDescription = serde_json::from_str(data)?;
                     pc.set_remote_description(desc).await?;
+                    eprintln!("[VOICE] Set remote description for {}", sender_id);
+                } else {
+                    eprintln!("[VOICE] No peer connection found for {}", sender_id);
                 }
             }
             "candidate" => {
+                eprintln!("[VOICE] Received ICE candidate from {}", sender_id);
                 let peers = self.peers.lock().await;
                 if let Some(pc) = peers.get(sender_id) {
                     let candidate: RTCIceCandidateInit = serde_json::from_str(data)?;
                     pc.add_ice_candidate(candidate).await?;
+                } else {
+                    eprintln!("[VOICE] No peer connection found for {} to add candidate", sender_id);
                 }
             }
             "leave_voice" => {
+                eprintln!("[VOICE] Peer {} left voice", sender_id);
                 let mut peers = self.peers.lock().await;
                 if let Some(pc) = peers.remove(sender_id) {
-                    pc.close().await?;
+                    tokio::spawn(async move {
+                        let _ = pc.close().await;
+                    });
                 }
                 self.event_tx.send(VoiceEvent::StatusUpdate(format!("{} left voice", sender_id)))?;
             }
-            _ => {}
+            _ => {
+                eprintln!("[VOICE] Unknown signal type: {}", signal_type);
+            }
         }
         Ok(())
     }
