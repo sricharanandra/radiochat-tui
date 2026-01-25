@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use audiopus::{coder::Decoder, coder::Encoder, Application, Channels, SampleRate};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 // Wrapper to make cpal::Stream Send (required for tokio::spawn)
@@ -24,30 +26,42 @@ impl AudioEngine {
     pub fn start_playback(&mut self, mut packet_rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Result<()> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or(anyhow!("No output device"))?;
-        let config = device.default_output_config()?;
+        let preferred_rates = [48000, 24000, 16000, 12000, 8000];
+        let mut selected_config = None;
+
+        for &rate in &preferred_rates {
+            let configs = device.supported_output_configs()?;
+            if let Some(c) = configs.into_iter().find(|c| {
+                c.min_sample_rate().0 <= rate && c.max_sample_rate().0 >= rate
+            }) {
+                selected_config = Some(c.with_sample_rate(cpal::SampleRate(rate)));
+                break;
+            }
+        }
+
+        let config = if let Some(c) = selected_config {
+            c
+        } else {
+            device.default_output_config()?
+        };
+
         let stream_config: cpal::StreamConfig = config.clone().into();
         let sample_rate = stream_config.sample_rate.0;
 
-        // Determine Opus Sample Rate based on output device
-        // If device is 44.1k, we must decode to 48k then resample, or force 48k?
-        // audiopus decoder takes input packet -> output PCM. 
-        // We can tell decoder to produce 48k PCM. If output device is 44.1k, CPAL needs to handle it or we resample.
-        // For MVP, assume 48k output or hope for the best.
-        
         let opus_rate = match sample_rate {
             48000 => SampleRate::Hz48000,
             24000 => SampleRate::Hz24000,
             16000 => SampleRate::Hz16000,
             12000 => SampleRate::Hz12000,
             8000 => SampleRate::Hz8000,
-            _ => SampleRate::Hz48000, // Fallback
+            _ => return Err(anyhow!("Output sample rate {} not supported by Opus", sample_rate)),
         };
 
-        // Channel to send decoded PCM samples to the audio callback
-        // Uses std::sync::mpsc because cpal callback is sync
-        let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let max_buffer_samples = sample_rate as usize * 2;
+        let shared_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(max_buffer_samples)));
 
         // Spawn Decoding Task
+        let buffer_for_decode = shared_buffer.clone();
         tokio::spawn(async move {
             let mut decoder = match Decoder::new(opus_rate, Channels::Mono) {
                 Ok(d) => d,
@@ -59,7 +73,13 @@ impl AudioEngine {
                 // Pass slice explicitly
                 match decoder.decode_float(Some(&packet), &mut output[..], false) {
                     Ok(len) => {
-                        let _ = pcm_tx.send(output[..len].to_vec());
+                        if let Ok(mut buffer) = buffer_for_decode.lock() {
+                            buffer.extend(output[..len].iter().copied());
+                            if buffer.len() > max_buffer_samples {
+                                let drain_count = buffer.len() - max_buffer_samples;
+                                buffer.drain(0..drain_count);
+                            }
+                        }
                     },
                     Err(_) => {},
                 }
@@ -72,45 +92,24 @@ impl AudioEngine {
         let stream = device.build_output_stream(
             &stream_config,
             move |data: &mut [f32], _: &_| {
-                // Fill buffer with data from pcm_rx
-                // If no data, fill with silence
-                
-                // Simple strategy: Try to read enough samples to fill `data`.
-                // If `pcm_rx` has a pending vector, take from it.
-                
-                // We need a buffer to hold leftover samples from previous callback
-                // But this closure is FnMut, so we can capture a buffer? 
-                // No, cpal calls this frequently.
-                
-                // Simplified: Just drain the channel as much as possible.
-                // This is naive and will cause jitter/gaps without a ring buffer.
-                // But for "hearing people", it's a start.
-                
-                let mut written = 0;
-                while written < data.len() {
-                    match pcm_rx.try_recv() {
-                        Ok(samples) => {
-                            for sample in samples {
-                                if written < data.len() {
-                                    data[written] = sample;
-                                    written += 1;
-                                } else {
-                                    // Drop overflow or buffer it? 
-                                    // Dropping causes glitches. Buffering inside FnMut closure is tricky without RefCell/Mutex.
-                                    // For MVP, we drop.
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            // Empty or disconnected
+                if let Ok(mut buffer) = shared_buffer.lock() {
+                    let mut written = 0;
+                    while written < data.len() {
+                        if let Some(sample) = buffer.pop_front() {
+                            data[written] = sample;
+                            written += 1;
+                        } else {
                             break;
                         }
                     }
-                }
-                
-                // Fill remainder with silence
-                for i in written..data.len() {
-                    data[i] = 0.0;
+
+                    for i in written..data.len() {
+                        data[i] = 0.0;
+                    }
+                } else {
+                    for sample in data.iter_mut() {
+                        *sample = 0.0;
+                    }
                 }
             },
             err_fn,

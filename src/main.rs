@@ -1856,6 +1856,9 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             )));
         }
         ServerMessage::VoiceSignal(payload) => {
+            if !app.voice_active {
+                return;
+            }
             if let Some(voice_tx) = &app.voice_tx {
                 if let (Some(sender_id), Some(_sender_username)) = (payload.sender_user_id, payload.sender_username) {
                     let _ = voice_tx.send(voice::manager::VoiceCommand::Signal {
@@ -3029,4 +3032,3 @@ fn restore_terminal(
     terminal.show_cursor()?;
     Ok(())
 }
-

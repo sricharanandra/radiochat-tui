@@ -39,6 +39,7 @@ pub struct VoiceManager {
     peers: Arc<Mutex<HashMap<String, Arc<RTCPeerConnection>>>>,
     local_track: Option<Arc<TrackLocalStaticSample>>,
     is_muted: Arc<AtomicBool>,
+    is_joined: Arc<AtomicBool>,
 }
 
 impl VoiceManager {
@@ -50,6 +51,7 @@ impl VoiceManager {
             peers: Arc::new(Mutex::new(HashMap::new())),
             local_track: None,
             is_muted: Arc::new(AtomicBool::new(false)),
+            is_joined: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -76,6 +78,7 @@ impl VoiceManager {
 
     async fn join_voice(&mut self, room_id: String) -> Result<()> {
         self.room_id = Some(room_id.clone());
+        self.is_joined.store(true, Ordering::Relaxed);
         
         // 1. Setup Audio Engine
         let (encoded_tx, mut encoded_rx) = mpsc::unbounded_channel();
@@ -177,9 +180,14 @@ impl VoiceManager {
 
         // Handle Incoming Tracks (Remote Audio)
         let audio_engine_clone = self.audio_engine.clone();
+        let is_joined = self.is_joined.clone();
         pc.on_track(Box::new(move |track, _, _| {
             let audio_engine = audio_engine_clone.clone();
+            let joined_state = is_joined.clone();
             Box::pin(async move {
+                if !joined_state.load(Ordering::Relaxed) {
+                    return;
+                }
                 let (packet_tx, packet_rx) = mpsc::unbounded_channel();
                 
                 // Start playback thread for this track
@@ -227,6 +235,7 @@ impl VoiceManager {
             self.event_tx.send(VoiceEvent::StatusUpdate("Left voice".to_string()))?;
         }
         self.room_id = None;
+        self.is_joined.store(false, Ordering::Relaxed);
         // Close all peers
         let mut peers = self.peers.lock().await;
         for (_, pc) in peers.iter() {
