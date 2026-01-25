@@ -84,7 +84,11 @@ impl VoiceManager {
         let (encoded_tx, mut encoded_rx) = mpsc::unbounded_channel();
         {
             let mut audio = self.audio_engine.lock().await;
-            audio.start_capture(encoded_tx)?;
+            if let Err(e) = audio.start_capture(encoded_tx) {
+                let err_msg = format!("Failed to start microphone: {}", e);
+                self.event_tx.send(VoiceEvent::Error(err_msg.clone()))?;
+                return Err(anyhow::anyhow!(err_msg));
+            }
         }
 
         // 2. Create Local Track
@@ -181,9 +185,11 @@ impl VoiceManager {
         // Handle Incoming Tracks (Remote Audio)
         let audio_engine_clone = self.audio_engine.clone();
         let is_joined = self.is_joined.clone();
+        let event_tx_clone = self.event_tx.clone();
         pc.on_track(Box::new(move |track, _, _| {
             let audio_engine = audio_engine_clone.clone();
             let joined_state = is_joined.clone();
+            let event_tx = event_tx_clone.clone();
             Box::pin(async move {
                 if !joined_state.load(Ordering::Relaxed) {
                     return;
@@ -193,8 +199,9 @@ impl VoiceManager {
                 // Start playback thread for this track
                 {
                     let mut engine = audio_engine.lock().await;
-                    // Ignore errors for now (e.g. no output device)
-                    let _ = engine.start_playback(packet_rx);
+                    if let Err(e) = engine.start_playback(packet_rx) {
+                        let _ = event_tx.send(VoiceEvent::Error(format!("Audio playback failed: {}", e)));
+                    }
                 }
 
                 // Loop reading RTP packets
