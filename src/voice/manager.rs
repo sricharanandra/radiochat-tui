@@ -21,6 +21,7 @@ use crate::voice::audio::AudioEngine;
 #[derive(Debug)]
 pub enum VoiceEvent {
     Signal { target_id: Option<String>, signal_type: String, data: String },
+    TxActivity(bool),
     StatusUpdate(String),
     Error(String),
 }
@@ -79,6 +80,7 @@ impl VoiceManager {
     async fn join_voice(&mut self, room_id: String) -> Result<()> {
         self.room_id = Some(room_id.clone());
         self.is_joined.store(true, Ordering::Relaxed);
+        let _ = self.event_tx.send(VoiceEvent::StatusUpdate("Connected".to_string()));
         
         // 1. Setup Audio Engine
         let (encoded_tx, mut encoded_rx) = mpsc::unbounded_channel();
@@ -104,12 +106,15 @@ impl VoiceManager {
 
         // 3. Spawn Task to feed audio to track
         let is_muted = self.is_muted.clone();
+        let event_tx = self.event_tx.clone();
         tokio::spawn(async move {
             while let Some(packet) = encoded_rx.recv().await {
                 // Check mute state
                 if is_muted.load(Ordering::Relaxed) {
                     continue; // Skip sending packets
                 }
+
+                let _ = event_tx.send(VoiceEvent::TxActivity(true));
                 
                 // Send sample to WebRTC track
                 let sample = Sample {
@@ -243,6 +248,7 @@ impl VoiceManager {
         }
         self.room_id = None;
         self.is_joined.store(false, Ordering::Relaxed);
+        let _ = self.event_tx.send(VoiceEvent::StatusUpdate("Disconnected".to_string()));
         // Close all peers
         let mut peers = self.peers.lock().await;
         for (_, pc) in peers.iter() {

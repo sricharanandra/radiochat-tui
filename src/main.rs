@@ -181,6 +181,9 @@ struct App<'a> {
     // Voice Chat
     voice_tx: Option<mpsc::UnboundedSender<voice::manager::VoiceCommand>>,
     voice_active: bool,
+    voice_muted: bool,
+    voice_tx_active: bool,
+    voice_tx_last: Option<std::time::Instant>,
     voice_users: Vec<String>,
 }
 
@@ -249,6 +252,9 @@ impl<'a> Default for App<'a> {
             emoji_partial: String::new(),
             voice_tx: None,
             voice_active: false,
+            voice_muted: false,
+            voice_tx_active: false,
+            voice_tx_last: None,
             voice_users: Vec::new(),
         }
     }
@@ -401,7 +407,24 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                     }
                 }
                 VoiceEvent::StatusUpdate(msg) => {
+                    if msg.eq_ignore_ascii_case("Connected") {
+                        app.voice_active = true;
+                    } else if msg.eq_ignore_ascii_case("Disconnected") {
+                        app.voice_active = false;
+                        app.voice_users.clear();
+                        app.voice_tx_active = false;
+                        app.voice_tx_last = None;
+                        app.voice_muted = false;
+                    } else if msg.eq_ignore_ascii_case("Muted") {
+                        app.voice_muted = true;
+                    } else if msg.eq_ignore_ascii_case("Unmuted") {
+                        app.voice_muted = false;
+                    }
                     app.status_message = format!("VOICE: {}", msg);
+                }
+                VoiceEvent::TxActivity(active) => {
+                    app.voice_tx_active = active;
+                    app.voice_tx_last = Some(std::time::Instant::now());
                 }
                 VoiceEvent::Error(e) => {
                     app.status_message = format!("VOICE ERROR: {}", e);
@@ -1325,6 +1348,9 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                     }
                     app.voice_active = false;
                     app.voice_users.clear();
+                    app.voice_muted = false;
+                    app.voice_tx_active = false;
+                    app.voice_tx_last = None;
                     
                     app.room_id = None;
                     app.room_name = None;
@@ -1583,27 +1609,35 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
         "vc" => {
             if app.current_screen == CurrentScreen::InRoom {
                 if let Some(room_id) = &app.room_id {
-                    let subcmd = parts.get(1).map(|s| *s).unwrap_or("");
-                    if let Some(voice_tx) = &app.voice_tx {
-                        match subcmd {
-                            "join" | "" => {
-                                if app.voice_active && app.voice_users.contains(&app.current_username.clone().unwrap_or_default()) {
-                                    app.status_message = "Already in voice chat.".to_string();
-                                } else {
-                                    let _ = voice_tx.send(voice::manager::VoiceCommand::Join(room_id.clone()));
-                                    app.status_message = "Joining voice...".to_string();
-                                }
-                            }
+            let subcmd = parts.get(1).map(|s| *s).unwrap_or("");
+            if let Some(voice_tx) = &app.voice_tx {
+                match subcmd {
+                    "join" | "" => {
+                        if app.voice_active && app.voice_users.contains(&app.current_username.clone().unwrap_or_default()) {
+                            app.status_message = "Already in voice chat.".to_string();
+                        } else {
+                            let _ = voice_tx.send(voice::manager::VoiceCommand::Join(room_id.clone()));
+                            app.status_message = "Joining voice...".to_string();
+                            app.voice_active = true;
+                        }
+                    }
                             "leave" | "l" => {
                                 let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
                                 app.status_message = "Leaving voice...".to_string();
+                                app.voice_active = false;
+                                app.voice_users.clear();
+                                app.voice_muted = false;
+                                app.voice_tx_active = false;
+                                app.voice_tx_last = None;
                             }
                             "mute" | "m" => {
                                 let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(true));
+                                app.voice_muted = true;
                                 app.status_message = "Microphone muted.".to_string();
                             }
                             "unmute" | "um" => {
                                 let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(false));
+                                app.voice_muted = false;
                                 app.status_message = "Microphone unmuted.".to_string();
                             }
                             _ => {
@@ -1873,6 +1907,10 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             if Some(payload.room_id) == app.room_id {
                 app.voice_users = payload.active_users;
                 app.voice_active = !app.voice_users.is_empty();
+                if !app.voice_active {
+                    app.voice_tx_active = false;
+                    app.voice_tx_last = None;
+                }
                 // TODO: Show notification if focused
             }
         }
@@ -2684,27 +2722,68 @@ fn render_user_list_overlay(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_voice_sidebar(f: &mut Frame, app: &App, area: Rect) {
-    // Only render if there are voice users or I am in voice
-    if app.voice_users.is_empty() {
-        return;
+    let header_style = Style::default().fg(Color::Green);
+    let border_style = Style::default().fg(Color::DarkGray);
+
+    let has_voice = !app.voice_users.is_empty();
+    let connection_label = if has_voice { "Connected" } else { "Idle" };
+    let connection_style = if has_voice {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let mute_label = if app.voice_muted { "Muted" } else { "Live" };
+    let mute_style = if app.voice_muted {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+
+    let tx_active = app.voice_tx_last.map(|ts| ts.elapsed() < std::time::Duration::from_millis(900)).unwrap_or(false);
+    let tx_label = if tx_active { "TX" } else { "Quiet" };
+    let tx_style = if tx_active {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let mut items: Vec<ListItem> = vec![
+        ListItem::new(Line::from(vec![
+            Span::styled("● ", connection_style),
+            Span::styled(connection_label, connection_style),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("🎙 ", mute_style),
+            Span::styled(mute_label, mute_style),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("⇅ ", tx_style),
+            Span::styled(tx_label, tx_style),
+        ])),
+    ];
+
+    if has_voice {
+        items.push(ListItem::new(""));
+        for user in &app.voice_users {
+            let style = if Some(user) == app.current_username.as_ref() {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            items.push(ListItem::new(format!("🔊 {}", user)).style(style));
+        }
     }
-    
-    let items: Vec<ListItem> = app.voice_users.iter().map(|u| {
-        let style = if Some(u) == app.current_username.as_ref() {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        ListItem::new(format!("🔊 {}", u)).style(style)
-    }).collect();
-    
+
     let list = List::new(items)
-        .block(Block::default()
-            .borders(Borders::RIGHT) // Separator line
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(" Voice ")
-            .title_style(Style::default().fg(Color::Green)));
-            
+        .block(
+            Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(border_style)
+                .title(" Voice ")
+                .title_style(header_style),
+        );
+
     f.render_widget(list, area);
 }
 
