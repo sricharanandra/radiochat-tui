@@ -100,9 +100,28 @@ impl AudioEngine {
         }
     }
 
+    /// Reset all audio streams - must be called before rejoining voice
+    pub fn reset(&mut self) {
+        // Drop input stream (stops capture)
+        if self.input_stream.take().is_some() {
+            eprintln!("[AUDIO] Stopped input stream");
+        }
+        
+        // Drop all output streams (stops playback)
+        let count = self.output_streams.len();
+        self.output_streams.clear();
+        if count > 0 {
+            eprintln!("[AUDIO] Stopped {} output stream(s)", count);
+        }
+    }
+
     pub fn start_playback(&mut self, mut packet_rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Result<()> {
+        eprintln!("[AUDIO] start_playback() called");
+        
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or(anyhow!("No output device"))?;
+        
+        eprintln!("[AUDIO] Output device: {:?}", device.name());
         
         // Try to find a config that supports 48kHz (Opus native)
         let preferred_rates = [48000, 24000, 16000, 12000, 8000];
@@ -127,6 +146,8 @@ impl AudioEngine {
 
         let stream_config: cpal::StreamConfig = config.clone().into();
         let device_sample_rate = stream_config.sample_rate.0;
+        
+        eprintln!("[AUDIO] Output sample rate: {}", device_sample_rate);
 
         // Opus only supports specific rates. We decode to 48k and resample if needed.
         let opus_rate = SampleRate::Hz48000;
@@ -142,10 +163,22 @@ impl AudioEngine {
         tokio::spawn(async move {
             let mut decoder = match Decoder::new(opus_rate, Channels::Mono) {
                 Ok(d) => d,
-                Err(_) => return,
+                Err(e) => {
+                    eprintln!("[AUDIO] Failed to create Opus decoder: {:?}", e);
+                    return;
+                }
             };
+            
+            let mut packet_count = 0u64;
 
             while let Some(packet) = packet_rx.recv().await {
+                packet_count += 1;
+                if packet_count == 1 {
+                    eprintln!("[AUDIO] Received first audio packet ({} bytes)", packet.len());
+                } else if packet_count % 500 == 0 {
+                    eprintln!("[AUDIO] Received {} packets", packet_count);
+                }
+                
                 let mut output = [0.0f32; 1920]; // 40ms at 48k
                 match decoder.decode_float(Some(&packet), &mut output[..], false) {
                     Ok(len) => {
@@ -162,9 +195,14 @@ impl AudioEngine {
                             }
                         }
                     },
-                    Err(_) => {},
+                    Err(e) => {
+                        if packet_count <= 5 {
+                            eprintln!("[AUDIO] Decode error: {:?}", e);
+                        }
+                    },
                 }
             }
+            eprintln!("[AUDIO] Decode loop ended after {} packets", packet_count);
         });
 
         // Setup CPAL Output Stream
@@ -199,6 +237,7 @@ impl AudioEngine {
 
         stream.play()?;
         self.output_streams.push(SendStream(stream));
+        eprintln!("[AUDIO] Playback stream started successfully (total: {})", self.output_streams.len());
         Ok(())
     }
 

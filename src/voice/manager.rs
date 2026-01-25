@@ -78,6 +78,15 @@ impl VoiceManager {
     }
 
     async fn join_voice(&mut self, room_id: String) -> Result<()> {
+        eprintln!("[VOICE] join_voice called for room: {}", room_id);
+        
+        // Reset any existing state first (in case of rejoin)
+        {
+            let mut audio = self.audio_engine.lock().await;
+            audio.reset();
+        }
+        self.local_track = None;
+        
         self.room_id = Some(room_id.clone());
         self.is_joined.store(true, Ordering::Relaxed);
         let _ = self.event_tx.send(VoiceEvent::StatusUpdate("Connected".to_string()));
@@ -88,9 +97,11 @@ impl VoiceManager {
             let mut audio = self.audio_engine.lock().await;
             if let Err(e) = audio.start_capture(encoded_tx) {
                 let err_msg = format!("Failed to start microphone: {}", e);
+                eprintln!("[VOICE] {}", err_msg);
                 self.event_tx.send(VoiceEvent::Error(err_msg.clone()))?;
                 return Err(anyhow::anyhow!(err_msg));
             }
+            eprintln!("[VOICE] Microphone capture started");
         }
 
         // 2. Create Local Track
@@ -191,12 +202,17 @@ impl VoiceManager {
         let audio_engine_clone = self.audio_engine.clone();
         let is_joined = self.is_joined.clone();
         let event_tx_clone = self.event_tx.clone();
+        let remote_user_for_track = remote_user_id.clone();
         pc.on_track(Box::new(move |track, _, _| {
             let audio_engine = audio_engine_clone.clone();
             let joined_state = is_joined.clone();
             let event_tx = event_tx_clone.clone();
+            let peer_id = remote_user_for_track.clone();
             Box::pin(async move {
+                eprintln!("[VOICE] on_track fired for peer: {}", peer_id);
+                
                 if !joined_state.load(Ordering::Relaxed) {
+                    eprintln!("[VOICE] Ignoring track - not joined");
                     return;
                 }
                 let (packet_tx, packet_rx) = mpsc::unbounded_channel();
@@ -204,15 +220,25 @@ impl VoiceManager {
                 // Start playback thread for this track
                 {
                     let mut engine = audio_engine.lock().await;
+                    eprintln!("[VOICE] Starting playback for peer: {}", peer_id);
                     if let Err(e) = engine.start_playback(packet_rx) {
+                        eprintln!("[VOICE] Audio playback failed for {}: {}", peer_id, e);
                         let _ = event_tx.send(VoiceEvent::Error(format!("Audio playback failed: {}", e)));
+                        return;
                     }
+                    eprintln!("[VOICE] Playback started successfully for peer: {}", peer_id);
                 }
 
                 // Loop reading RTP packets
+                let mut rtp_count = 0u64;
                 while let Ok((rtp, _attr)) = track.read_rtp().await {
+                    rtp_count += 1;
+                    if rtp_count == 1 {
+                        eprintln!("[VOICE] First RTP packet from {} ({} bytes payload)", peer_id, rtp.payload.len());
+                    }
                     let _ = packet_tx.send(rtp.payload.to_vec());
                 }
+                eprintln!("[VOICE] RTP loop ended for {} after {} packets", peer_id, rtp_count);
             })
         }));
 
@@ -237,6 +263,9 @@ impl VoiceManager {
     }
 
     async fn leave_voice(&mut self) -> Result<()> {
+        // Set joined flag to false FIRST to stop on_track callbacks
+        self.is_joined.store(false, Ordering::Relaxed);
+        
         if let Some(_room_id) = &self.room_id {
             // Notify server
             self.event_tx.send(VoiceEvent::Signal {
@@ -244,17 +273,30 @@ impl VoiceManager {
                 signal_type: "leave_voice".to_string(),
                 data: "".to_string(),
             })?;
-            self.event_tx.send(VoiceEvent::StatusUpdate("Left voice".to_string()))?;
         }
-        self.room_id = None;
-        self.is_joined.store(false, Ordering::Relaxed);
-        let _ = self.event_tx.send(VoiceEvent::StatusUpdate("Disconnected".to_string()));
-        // Close all peers
+        
+        // Reset audio engine (stops all streams)
+        {
+            let mut audio = self.audio_engine.lock().await;
+            audio.reset();
+        }
+        
+        // Clear local track
+        self.local_track = None;
+        
+        // Close all peers non-blocking (fire and forget)
         let mut peers = self.peers.lock().await;
-        for (_, pc) in peers.iter() {
-            pc.close().await?;
+        for (peer_id, pc) in peers.drain() {
+            tokio::spawn(async move {
+                eprintln!("[VOICE] Closing peer connection to {}", peer_id);
+                let _ = pc.close().await;
+            });
         }
-        peers.clear();
+        
+        self.room_id = None;
+        let _ = self.event_tx.send(VoiceEvent::StatusUpdate("Disconnected".to_string()));
+        let _ = self.event_tx.send(VoiceEvent::TxActivity(false));
+        
         Ok(())
     }
 
