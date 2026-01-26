@@ -9,6 +9,7 @@ use webrtc::api::APIBuilder;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
@@ -16,14 +17,49 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 use webrtc::track::track_local::TrackLocal;
 use webrtc::media::Sample;
 
-use crate::voice::audio::AudioEngine;
+use crate::voice::audio::{AudioEngine, AudioDeviceError};
 
+/// Voice connection status for UI display
+#[derive(Debug, Clone, PartialEq)]
+pub enum VoiceConnectionStatus {
+    Disconnected,
+    Connecting,
+    Connected,
+    Reconnecting,
+}
+
+impl Default for VoiceConnectionStatus {
+    fn default() -> Self {
+        VoiceConnectionStatus::Disconnected
+    }
+}
+
+/// Events sent from VoiceManager to main app
+/// ALL voice state changes in the app should be driven by these events
 #[derive(Debug)]
 pub enum VoiceEvent {
+    /// WebRTC signaling data to send to server
     Signal { target_id: Option<String>, signal_type: String, data: String },
-    TxActivity(bool),
-    StatusUpdate(String),
-    Error(String),
+    
+    /// Voice connection state changes (single source of truth)
+    Connecting,                    // Starting to join voice
+    Connected,                     // Successfully joined and audio is ready
+    Disconnected,                  // Clean disconnect completed
+    ConnectionFailed(String),      // Failed to connect (with reason)
+    
+    /// Peer connection state changes  
+    PeerConnected(String),         // WebRTC connection to peer established
+    PeerDisconnected(String),      // WebRTC connection to peer lost
+    PeerConnectionFailed(String),  // Failed to connect to specific peer
+    
+    /// Mute state changes (single source of truth)
+    MuteStateChanged(bool),        // true = muted, false = unmuted
+    
+    /// Transmit activity for UI indicator
+    TxActivity(bool),              // true = transmitting, false = quiet
+    
+    /// Audio system errors
+    AudioError(String),            // Audio device/stream error
 }
 
 pub enum VoiceCommand {
@@ -37,6 +73,7 @@ pub struct VoiceManager {
     room_id: Option<String>,
     event_tx: mpsc::UnboundedSender<VoiceEvent>,
     audio_engine: Arc<Mutex<AudioEngine>>,
+    audio_error_rx: Option<mpsc::UnboundedReceiver<AudioDeviceError>>,
     peers: Arc<Mutex<HashMap<String, Arc<RTCPeerConnection>>>>,
     local_track: Option<Arc<TrackLocalStaticSample>>,
     is_muted: Arc<AtomicBool>,
@@ -45,10 +82,18 @@ pub struct VoiceManager {
 
 impl VoiceManager {
     pub fn new(event_tx: mpsc::UnboundedSender<VoiceEvent>) -> Self {
+        // Create audio error channel
+        let (audio_error_tx, audio_error_rx) = mpsc::unbounded_channel::<AudioDeviceError>();
+        
+        // Create audio engine with error channel
+        let mut audio_engine = AudioEngine::new();
+        audio_engine.set_error_channel(audio_error_tx);
+        
         Self {
             room_id: None,
             event_tx,
-            audio_engine: Arc::new(Mutex::new(AudioEngine::new())),
+            audio_engine: Arc::new(Mutex::new(audio_engine)),
+            audio_error_rx: Some(audio_error_rx),
             peers: Arc::new(Mutex::new(HashMap::new())),
             local_track: None,
             is_muted: Arc::new(AtomicBool::new(false)),
@@ -57,28 +102,54 @@ impl VoiceManager {
     }
 
     pub async fn run(&mut self, mut command_rx: mpsc::UnboundedReceiver<VoiceCommand>) {
-        while let Some(cmd) = command_rx.recv().await {
-            match cmd {
-                VoiceCommand::Join(room_id) => {
-                    let _ = self.join_voice(room_id).await;
+        // Take ownership of the audio error receiver
+        let mut audio_error_rx = self.audio_error_rx.take();
+        
+        loop {
+            tokio::select! {
+                // Handle voice commands
+                Some(cmd) = command_rx.recv() => {
+                    match cmd {
+                        VoiceCommand::Join(room_id) => {
+                            let _ = self.join_voice(room_id).await;
+                        }
+                        VoiceCommand::Leave => {
+                            let _ = self.leave_voice().await;
+                        }
+                        VoiceCommand::Mute(muted) => {
+                            self.is_muted.store(muted, Ordering::Relaxed);
+                            let _ = self.event_tx.send(VoiceEvent::MuteStateChanged(muted));
+                        }
+                        VoiceCommand::Signal { sender_id, signal_type, data } => {
+                            let _ = self.handle_signal(&sender_id, &signal_type, &data).await;
+                        }
+                    }
                 }
-                VoiceCommand::Leave => {
-                    let _ = self.leave_voice().await;
+                // Handle audio errors
+                Some(err) = async { 
+                    if let Some(ref mut rx) = audio_error_rx { 
+                        rx.recv().await 
+                    } else { 
+                        None 
+                    } 
+                } => {
+                    let err_msg = match err {
+                        AudioDeviceError::OutputDeviceError(e) => format!("Output device error: {}", e),
+                        AudioDeviceError::InputDeviceError(e) => format!("Input device error: {}", e),
+                    };
+                    eprintln!("[VOICE] Audio error: {}", err_msg);
+                    let _ = self.event_tx.send(VoiceEvent::AudioError(err_msg));
                 }
-                VoiceCommand::Mute(muted) => {
-                    self.is_muted.store(muted, Ordering::Relaxed);
-                    let status = if muted { "Muted" } else { "Unmuted" };
-                    let _ = self.event_tx.send(VoiceEvent::StatusUpdate(status.to_string()));
-                }
-                VoiceCommand::Signal { sender_id, signal_type, data } => {
-                    let _ = self.handle_signal(&sender_id, &signal_type, &data).await;
-                }
+                else => break,
             }
         }
     }
 
     async fn join_voice(&mut self, room_id: String) -> Result<()> {
         eprintln!("[VOICE] join_voice called for room: {}", room_id);
+        
+        // Send Connecting event immediately
+        let _ = self.event_tx.send(VoiceEvent::Connecting);
         
         // Reset any existing state first (in case of rejoin)
         {
@@ -89,7 +160,6 @@ impl VoiceManager {
         
         self.room_id = Some(room_id.clone());
         self.is_joined.store(true, Ordering::Relaxed);
-        let _ = self.event_tx.send(VoiceEvent::StatusUpdate("Connected".to_string()));
         
         // 1. Setup Audio Engine
         let (encoded_tx, mut encoded_rx) = mpsc::unbounded_channel();
@@ -98,8 +168,10 @@ impl VoiceManager {
             if let Err(e) = audio.start_capture(encoded_tx) {
                 let err_msg = format!("Failed to start microphone: {}", e);
                 eprintln!("[VOICE] {}", err_msg);
-                self.event_tx.send(VoiceEvent::Error(err_msg.clone()))?;
-                return Err(anyhow::anyhow!(err_msg));
+                self.is_joined.store(false, Ordering::Relaxed);
+                self.room_id = None;
+                let _ = self.event_tx.send(VoiceEvent::ConnectionFailed(err_msg));
+                return Err(anyhow::anyhow!("Microphone capture failed"));
             }
             eprintln!("[VOICE] Microphone capture started");
         }
@@ -146,7 +218,9 @@ impl VoiceManager {
             data: "".to_string(),
         })?;
         
-        self.event_tx.send(VoiceEvent::StatusUpdate(format!("Joined voice in room {}", room_id)))?;
+        // Send Connected event - audio is ready
+        let _ = self.event_tx.send(VoiceEvent::Connected);
+        eprintln!("[VOICE] Successfully joined voice in room {}", room_id);
         
         Ok(())
     }
@@ -157,7 +231,7 @@ impl VoiceManager {
         m.register_default_codecs()?;
         
         // Setup API
-        let mut registry = register_default_interceptors(webrtc::interceptor::registry::Registry::new(), &mut m)?;
+        let registry = register_default_interceptors(webrtc::interceptor::registry::Registry::new(), &mut m)?;
         let api = APIBuilder::new()
             .with_media_engine(m)
             .with_interceptor_registry(registry)
@@ -198,6 +272,39 @@ impl VoiceManager {
             })
         }));
 
+        // Monitor peer connection state changes
+        let event_tx_for_pc_state = self.event_tx.clone();
+        let remote_id_for_pc_state = remote_user_id.clone();
+        pc.on_peer_connection_state_change(Box::new(move |state| {
+            let tx = event_tx_for_pc_state.clone();
+            let peer_id = remote_id_for_pc_state.clone();
+            Box::pin(async move {
+                eprintln!("[VOICE] Peer {} connection state changed: {:?}", peer_id, state);
+                match state {
+                    RTCPeerConnectionState::Connected => {
+                        let _ = tx.send(VoiceEvent::PeerConnected(peer_id));
+                    }
+                    RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Closed => {
+                        let _ = tx.send(VoiceEvent::PeerDisconnected(peer_id));
+                    }
+                    RTCPeerConnectionState::Failed => {
+                        let _ = tx.send(VoiceEvent::PeerConnectionFailed(peer_id));
+                    }
+                    _ => {}
+                }
+            })
+        }));
+
+        // Monitor ICE connection state changes
+        let remote_id_for_ice = remote_user_id.clone();
+        pc.on_ice_connection_state_change(Box::new(move |state| {
+            let peer_id = remote_id_for_ice.clone();
+            Box::pin(async move {
+                eprintln!("[VOICE] Peer {} ICE state changed: {:?}", peer_id, state);
+                // Just log for now - peer_connection_state_change handles events
+            })
+        }));
+
         // Handle Incoming Tracks (Remote Audio)
         let audio_engine_clone = self.audio_engine.clone();
         let is_joined = self.is_joined.clone();
@@ -223,7 +330,7 @@ impl VoiceManager {
                     eprintln!("[VOICE] Starting playback for peer: {}", peer_id);
                     if let Err(e) = engine.start_playback(packet_rx) {
                         eprintln!("[VOICE] Audio playback failed for {}: {}", peer_id, e);
-                        let _ = event_tx.send(VoiceEvent::Error(format!("Audio playback failed: {}", e)));
+                        let _ = event_tx.send(VoiceEvent::AudioError(format!("Audio playback failed: {}", e)));
                         return;
                     }
                     eprintln!("[VOICE] Playback started successfully for peer: {}", peer_id);
@@ -263,16 +370,18 @@ impl VoiceManager {
     }
 
     async fn leave_voice(&mut self) -> Result<()> {
+        eprintln!("[VOICE] leave_voice called");
+        
         // Set joined flag to false FIRST to stop on_track callbacks
         self.is_joined.store(false, Ordering::Relaxed);
         
         if let Some(_room_id) = &self.room_id {
             // Notify server
-            self.event_tx.send(VoiceEvent::Signal {
+            let _ = self.event_tx.send(VoiceEvent::Signal {
                 target_id: None,
                 signal_type: "leave_voice".to_string(),
                 data: "".to_string(),
-            })?;
+            });
         }
         
         // Reset audio engine (stops all streams)
@@ -284,18 +393,27 @@ impl VoiceManager {
         // Clear local track
         self.local_track = None;
         
-        // Close all peers non-blocking (fire and forget)
-        let mut peers = self.peers.lock().await;
-        for (peer_id, pc) in peers.drain() {
-            tokio::spawn(async move {
+        // Close all peers and wait for completion (don't fire-and-forget)
+        {
+            let mut peers = self.peers.lock().await;
+            for (peer_id, pc) in peers.drain() {
                 eprintln!("[VOICE] Closing peer connection to {}", peer_id);
+                // Close synchronously to ensure cleanup completes
                 let _ = pc.close().await;
-            });
+                let _ = self.event_tx.send(VoiceEvent::PeerDisconnected(peer_id));
+            }
         }
         
+        // Reset mute state
+        self.is_muted.store(false, Ordering::Relaxed);
+        
         self.room_id = None;
-        let _ = self.event_tx.send(VoiceEvent::StatusUpdate("Disconnected".to_string()));
+        
+        // Send Disconnected event AFTER all cleanup is complete
         let _ = self.event_tx.send(VoiceEvent::TxActivity(false));
+        let _ = self.event_tx.send(VoiceEvent::MuteStateChanged(false));
+        let _ = self.event_tx.send(VoiceEvent::Disconnected);
+        eprintln!("[VOICE] leave_voice completed");
         
         Ok(())
     }
@@ -360,11 +478,9 @@ impl VoiceManager {
                 eprintln!("[VOICE] Peer {} left voice", sender_id);
                 let mut peers = self.peers.lock().await;
                 if let Some(pc) = peers.remove(sender_id) {
-                    tokio::spawn(async move {
-                        let _ = pc.close().await;
-                    });
+                    let _ = pc.close().await;
                 }
-                self.event_tx.send(VoiceEvent::StatusUpdate(format!("{} left voice", sender_id)))?;
+                let _ = self.event_tx.send(VoiceEvent::PeerDisconnected(sender_id.to_string()));
             }
             _ => {
                 eprintln!("[VOICE] Unknown signal type: {}", signal_type);

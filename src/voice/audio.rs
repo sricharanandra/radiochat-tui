@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use audiopus::{coder::Decoder, coder::Encoder, Application, Channels, SampleRate};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::StreamError;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -9,9 +10,20 @@ use tokio::sync::mpsc;
 struct SendStream(cpal::Stream);
 unsafe impl Send for SendStream {}
 
+/// Audio errors that can be reported to the VoiceManager
+#[derive(Debug, Clone)]
+pub enum AudioDeviceError {
+    /// Output device disconnected or failed
+    OutputDeviceError(String),
+    /// Input device disconnected or failed  
+    InputDeviceError(String),
+}
+
 pub struct AudioEngine {
     input_stream: Option<SendStream>,
     output_streams: Vec<SendStream>,
+    /// Channel to report audio errors back to VoiceManager
+    error_tx: Option<mpsc::UnboundedSender<AudioDeviceError>>,
 }
 
 struct StatefulResampler {
@@ -97,7 +109,13 @@ impl AudioEngine {
         Self { 
             input_stream: None,
             output_streams: Vec::new(),
+            error_tx: None,
         }
+    }
+    
+    /// Set the error channel for reporting audio device errors
+    pub fn set_error_channel(&mut self, tx: mpsc::UnboundedSender<AudioDeviceError>) {
+        self.error_tx = Some(tx);
     }
 
     /// Reset all audio streams - must be called before rejoining voice
@@ -205,8 +223,14 @@ impl AudioEngine {
             eprintln!("[AUDIO] Decode loop ended after {} packets", packet_count);
         });
 
-        // Setup CPAL Output Stream
-        let err_fn = |_err| {};
+        // Setup CPAL Output Stream with proper error handling
+        let error_tx_for_output = self.error_tx.clone();
+        let err_fn = move |err: StreamError| {
+            eprintln!("[AUDIO] Output stream error: {:?}", err);
+            if let Some(tx) = &error_tx_for_output {
+                let _ = tx.send(AudioDeviceError::OutputDeviceError(format!("{:?}", err)));
+            }
+        };
         
         let stream = device.build_output_stream(
             &stream_config,
@@ -311,8 +335,14 @@ impl AudioEngine {
             }
         });
 
-        // Setup CPAL Input Stream
-        let err_fn = |_err| {};
+        // Setup CPAL Input Stream with proper error handling
+        let error_tx_for_input = self.error_tx.clone();
+        let err_fn = move |err: StreamError| {
+            eprintln!("[AUDIO] Input stream error: {:?}", err);
+            if let Some(tx) = &error_tx_for_input {
+                let _ = tx.send(AudioDeviceError::InputDeviceError(format!("{:?}", err)));
+            }
+        };
         
         let stream = device.build_input_stream(
             &stream_config,

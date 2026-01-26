@@ -10,7 +10,7 @@ use crate::crypto::{decrypt, encrypt, key_from_hex, AesKey};
 use crate::clipboard::ClipboardManager;
 use crate::config::Config;
 use crate::vim::{VimMode, VimState};
-use crate::voice::manager::{VoiceManager, VoiceEvent};
+use crate::voice::manager::{VoiceManager, VoiceEvent, VoiceConnectionStatus};
 use api::{ClientMessage, CreateRoomPayload, JoinRoomPayload, ListRoomsPayload, SendMessagePayload, ServerMessage, RoomInfo, TypingPayload, CreateInvitePayload, JoinViaInvitePayload, RenameRoomPayload, DeleteRoomPayload, TransferOwnershipPayload, CreateDMPayload, VoiceSignalPayload};
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
@@ -110,6 +110,41 @@ impl ChatMessage {
     }
 }
 
+/// Voice chat state - single source of truth for voice UI
+/// All state changes come from VoiceEvent handlers, never from commands
+#[derive(Default)]
+struct VoiceState {
+    /// Connection status (Disconnected, Connecting, Connected, Reconnecting)
+    pub status: VoiceConnectionStatus,
+    /// Whether microphone is muted
+    pub is_muted: bool,
+    /// Whether currently transmitting audio
+    pub is_transmitting: bool,
+    /// Last time we transmitted (for UI indicator timeout)
+    pub tx_last_time: Option<std::time::Instant>,
+    /// List of users in the voice channel (from server VoiceState messages)
+    pub room_users: Vec<String>,
+    /// Connected peers (WebRTC connections established)
+    pub connected_peers: Vec<String>,
+}
+
+impl VoiceState {
+    /// Check if we're connected to voice
+    pub fn is_connected(&self) -> bool {
+        matches!(self.status, VoiceConnectionStatus::Connected)
+    }
+    
+    /// Reset all state (called on disconnect)
+    pub fn reset(&mut self) {
+        self.status = VoiceConnectionStatus::Disconnected;
+        self.is_muted = false;
+        self.is_transmitting = false;
+        self.tx_last_time = None;
+        self.connected_peers.clear();
+        // Note: room_users is NOT cleared here - it comes from server
+    }
+}
+
 struct App<'a> {
     // Inputs
     room_name_input: TextArea<'a>,
@@ -180,11 +215,7 @@ struct App<'a> {
 
     // Voice Chat
     voice_tx: Option<mpsc::UnboundedSender<voice::manager::VoiceCommand>>,
-    voice_active: bool,
-    voice_muted: bool,
-    voice_tx_active: bool,
-    voice_tx_last: Option<std::time::Instant>,
-    voice_users: Vec<String>,
+    voice: VoiceState,
 }
 
 impl<'a> Default for App<'a> {
@@ -251,11 +282,7 @@ impl<'a> Default for App<'a> {
             emoji_selected_index: 0,
             emoji_partial: String::new(),
             voice_tx: None,
-            voice_active: false,
-            voice_muted: false,
-            voice_tx_active: false,
-            voice_tx_last: None,
-            voice_users: Vec::new(),
+            voice: VoiceState::default(),
         }
     }
 }
@@ -383,7 +410,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
             }
         }
 
-        // Handle Voice Events
+        // Handle Voice Events - ALL voice state changes happen here
         if let Ok(event) = voice_event_rx.try_recv() {
             match event {
                 VoiceEvent::Signal { target_id, signal_type, data } => {
@@ -406,28 +433,54 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                         }
                     }
                 }
-                VoiceEvent::StatusUpdate(msg) => {
-                    if msg.eq_ignore_ascii_case("Connected") {
-                        app.voice_active = true;
-                    } else if msg.eq_ignore_ascii_case("Disconnected") {
-                        app.voice_active = false;
-                        app.voice_users.clear();
-                        app.voice_tx_active = false;
-                        app.voice_tx_last = None;
-                        app.voice_muted = false;
-                    } else if msg.eq_ignore_ascii_case("Muted") {
-                        app.voice_muted = true;
-                    } else if msg.eq_ignore_ascii_case("Unmuted") {
-                        app.voice_muted = false;
+                VoiceEvent::Connecting => {
+                    app.voice.status = VoiceConnectionStatus::Connecting;
+                    app.status_message = "Connecting to voice...".to_string();
+                }
+                VoiceEvent::Connected => {
+                    app.voice.status = VoiceConnectionStatus::Connected;
+                    app.voice.is_muted = false;
+                    app.voice.is_transmitting = false;
+                    app.status_message = "Connected to voice.".to_string();
+                }
+                VoiceEvent::Disconnected => {
+                    app.voice.reset();
+                    app.status_message = "Disconnected from voice.".to_string();
+                }
+                VoiceEvent::ConnectionFailed(reason) => {
+                    app.voice.reset();
+                    app.status_message = format!("Voice connection failed: {}", reason);
+                }
+                VoiceEvent::PeerConnected(peer_id) => {
+                    if !app.voice.connected_peers.contains(&peer_id) {
+                        app.voice.connected_peers.push(peer_id.clone());
                     }
-                    app.status_message = format!("VOICE: {}", msg);
+                    eprintln!("[MAIN] Peer connected: {}", peer_id);
+                }
+                VoiceEvent::PeerDisconnected(peer_id) => {
+                    app.voice.connected_peers.retain(|p| p != &peer_id);
+                    eprintln!("[MAIN] Peer disconnected: {}", peer_id);
+                }
+                VoiceEvent::PeerConnectionFailed(peer_id) => {
+                    app.voice.connected_peers.retain(|p| p != &peer_id);
+                    eprintln!("[MAIN] Peer connection failed: {}", peer_id);
+                }
+                VoiceEvent::MuteStateChanged(muted) => {
+                    app.voice.is_muted = muted;
+                    app.status_message = if muted { 
+                        "Microphone muted.".to_string() 
+                    } else { 
+                        "Microphone unmuted.".to_string() 
+                    };
                 }
                 VoiceEvent::TxActivity(active) => {
-                    app.voice_tx_active = active;
-                    app.voice_tx_last = Some(std::time::Instant::now());
+                    app.voice.is_transmitting = active;
+                    if active {
+                        app.voice.tx_last_time = Some(std::time::Instant::now());
+                    }
                 }
-                VoiceEvent::Error(e) => {
-                    app.status_message = format!("VOICE ERROR: {}", e);
+                VoiceEvent::AudioError(e) => {
+                    app.status_message = format!("Audio error: {}", e);
                 }
             }
         }
@@ -1343,14 +1396,13 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
             match app.current_screen {
                 CurrentScreen::InRoom => {
                     // Leave room, return to main menu
+                    // Send Leave command - state will be reset via VoiceEvent::Disconnected
                     if let Some(voice_tx) = &app.voice_tx {
                         let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
                     }
-                    app.voice_active = false;
-                    app.voice_users.clear();
-                    app.voice_muted = false;
-                    app.voice_tx_active = false;
-                    app.voice_tx_last = None;
+                    // Note: voice state reset happens via VoiceEvent::Disconnected handler
+                    // Clear room_users separately since that's from server, not voice events
+                    app.voice.room_users.clear();
                     
                     app.room_id = None;
                     app.room_name = None;
@@ -1609,36 +1661,33 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
         "vc" => {
             if app.current_screen == CurrentScreen::InRoom {
                 if let Some(room_id) = &app.room_id {
-            let subcmd = parts.get(1).map(|s| *s).unwrap_or("");
-            if let Some(voice_tx) = &app.voice_tx {
-                match subcmd {
-                    "join" | "" => {
-                        if app.voice_active && app.voice_users.contains(&app.current_username.clone().unwrap_or_default()) {
-                            app.status_message = "Already in voice chat.".to_string();
-                        } else {
-                            let _ = voice_tx.send(voice::manager::VoiceCommand::Join(room_id.clone()));
-                            app.status_message = "Joining voice...".to_string();
-                            app.voice_active = true;
-                        }
-                    }
+                    let subcmd = parts.get(1).map(|s| *s).unwrap_or("");
+                    if let Some(voice_tx) = &app.voice_tx {
+                        match subcmd {
+                            "join" | "" => {
+                                // Check if already connected (using voice state, not server state)
+                                if app.voice.is_connected() {
+                                    app.status_message = "Already in voice chat.".to_string();
+                                } else if matches!(app.voice.status, VoiceConnectionStatus::Connecting) {
+                                    app.status_message = "Already connecting to voice...".to_string();
+                                } else {
+                                    // Just send the command - state changes via VoiceEvent::Connecting/Connected
+                                    let _ = voice_tx.send(voice::manager::VoiceCommand::Join(room_id.clone()));
+                                    app.status_message = "Joining voice...".to_string();
+                                }
+                            }
                             "leave" | "l" => {
+                                // Just send the command - state changes via VoiceEvent::Disconnected
                                 let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
                                 app.status_message = "Leaving voice...".to_string();
-                                app.voice_active = false;
-                                app.voice_users.clear();
-                                app.voice_muted = false;
-                                app.voice_tx_active = false;
-                                app.voice_tx_last = None;
                             }
                             "mute" | "m" => {
+                                // Just send the command - state changes via VoiceEvent::MuteStateChanged
                                 let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(true));
-                                app.voice_muted = true;
-                                app.status_message = "Microphone muted.".to_string();
                             }
                             "unmute" | "um" => {
+                                // Just send the command - state changes via VoiceEvent::MuteStateChanged
                                 let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(false));
-                                app.voice_muted = false;
-                                app.status_message = "Microphone unmuted.".to_string();
                             }
                             _ => {
                                 app.status_message = "Usage: :vc [join|leave|mute|unmute]".to_string();
@@ -1652,17 +1701,15 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
                 app.status_message = ":vc only works inside a room".to_string();
             }
         }
-        // Aliases
+        // Aliases - just send commands, state changes via events
         "m" | "mute" => {
             if let Some(voice_tx) = &app.voice_tx {
                 let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(true));
-                app.status_message = "Microphone muted.".to_string();
             }
         }
         "um" | "unmute" => {
             if let Some(voice_tx) = &app.voice_tx {
                 let _ = voice_tx.send(voice::manager::VoiceCommand::Mute(false));
-                app.status_message = "Microphone unmuted.".to_string();
             }
         }
         "vcl" => {
@@ -1890,13 +1937,12 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             )));
         }
         ServerMessage::VoiceSignal(payload) => {
-            eprintln!("[MAIN] Received VoiceSignal: type={}, sender={:?}, voice_active={}", 
-                payload.signal_type, payload.sender_username, app.voice_active);
+            eprintln!("[MAIN] Received VoiceSignal: type={}, sender={:?}, voice_status={:?}", 
+                payload.signal_type, payload.sender_username, app.voice.status);
             
-            if !app.voice_active {
-                eprintln!("[MAIN] Ignoring signal - voice not active");
-                return;
-            }
+            // Forward signals to VoiceManager regardless of local state
+            // The VoiceManager has its own is_joined flag and will handle appropriately
+            // This fixes the race condition where signals arrive before Connected event
             if let Some(voice_tx) = &app.voice_tx {
                 if let (Some(sender_id), Some(_sender_username)) = (payload.sender_user_id, payload.sender_username) {
                     eprintln!("[MAIN] Forwarding signal to VoiceManager: type={}, sender_id={}", payload.signal_type, sender_id);
@@ -1913,14 +1959,11 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             }
         }
         ServerMessage::VoiceState(payload) => {
+            // Only update room_users from server - this is the authoritative list of who's in voice
+            // Do NOT derive voice.status from this - that comes from VoiceEvent handlers
             if Some(payload.room_id) == app.room_id {
-                app.voice_users = payload.active_users;
-                app.voice_active = !app.voice_users.is_empty();
-                if !app.voice_active {
-                    app.voice_tx_active = false;
-                    app.voice_tx_last = None;
-                }
-                // TODO: Show notification if focused
+                app.voice.room_users = payload.active_users;
+                eprintln!("[MAIN] VoiceState updated: room_users={:?}", app.voice.room_users);
             }
         }
     }
@@ -2734,22 +2777,26 @@ fn render_voice_sidebar(f: &mut Frame, app: &App, area: Rect) {
     let header_style = Style::default().fg(Color::Green);
     let border_style = Style::default().fg(Color::DarkGray);
 
-    let has_voice = !app.voice_users.is_empty();
-    let connection_label = if has_voice { "Connected" } else { "Idle" };
-    let connection_style = if has_voice {
-        Style::default().fg(Color::Green)
-    } else {
-        Style::default().fg(Color::DarkGray)
+    // Connection status based on VoiceState.status (single source of truth)
+    let (connection_label, connection_style) = match app.voice.status {
+        VoiceConnectionStatus::Disconnected => ("Idle", Style::default().fg(Color::DarkGray)),
+        VoiceConnectionStatus::Connecting => ("Connecting...", Style::default().fg(Color::Yellow)),
+        VoiceConnectionStatus::Connected => ("Connected", Style::default().fg(Color::Green)),
+        VoiceConnectionStatus::Reconnecting => ("Reconnecting...", Style::default().fg(Color::Yellow)),
     };
 
-    let mute_label = if app.voice_muted { "Muted" } else { "Live" };
-    let mute_style = if app.voice_muted {
+    // Mute status from VoiceState
+    let mute_label = if app.voice.is_muted { "Muted" } else { "Live" };
+    let mute_style = if app.voice.is_muted {
         Style::default().fg(Color::Red)
     } else {
         Style::default().fg(Color::Cyan)
     };
 
-    let tx_active = app.voice_tx_last.map(|ts| ts.elapsed() < std::time::Duration::from_millis(900)).unwrap_or(false);
+    // TX activity - show "TX" if we transmitted recently (within 900ms)
+    let tx_active = app.voice.tx_last_time
+        .map(|ts| ts.elapsed() < std::time::Duration::from_millis(900))
+        .unwrap_or(false);
     let tx_label = if tx_active { "TX" } else { "Quiet" };
     let tx_style = if tx_active {
         Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
@@ -2772,9 +2819,10 @@ fn render_voice_sidebar(f: &mut Frame, app: &App, area: Rect) {
         ])),
     ];
 
-    if has_voice {
+    // Show users in voice (from server VoiceState messages)
+    if !app.voice.room_users.is_empty() {
         items.push(ListItem::new(""));
-        for user in &app.voice_users {
+        for user in &app.voice.room_users {
             let style = if Some(user) == app.current_username.as_ref() {
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
             } else {
