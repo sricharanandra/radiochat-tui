@@ -121,25 +121,15 @@ impl AudioEngine {
     /// Reset all audio streams - must be called before rejoining voice
     pub fn reset(&mut self) {
         // Drop input stream (stops capture)
-        if self.input_stream.take().is_some() {
-            eprintln!("[AUDIO] Stopped input stream");
-        }
+        self.input_stream.take();
         
         // Drop all output streams (stops playback)
-        let count = self.output_streams.len();
         self.output_streams.clear();
-        if count > 0 {
-            eprintln!("[AUDIO] Stopped {} output stream(s)", count);
-        }
     }
 
     pub fn start_playback(&mut self, mut packet_rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Result<()> {
-        eprintln!("[AUDIO] start_playback() called");
-        
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or(anyhow!("No output device"))?;
-        
-        eprintln!("[AUDIO] Output device: {:?}", device.name());
         
         // Try to find a config that supports 48kHz (Opus native)
         let preferred_rates = [48000, 24000, 16000, 12000, 8000];
@@ -164,8 +154,6 @@ impl AudioEngine {
 
         let stream_config: cpal::StreamConfig = config.clone().into();
         let device_sample_rate = stream_config.sample_rate.0;
-        
-        eprintln!("[AUDIO] Output sample rate: {}", device_sample_rate);
 
         // Opus only supports specific rates. We decode to 48k and resample if needed.
         let opus_rate = SampleRate::Hz48000;
@@ -181,52 +169,31 @@ impl AudioEngine {
         tokio::spawn(async move {
             let mut decoder = match Decoder::new(opus_rate, Channels::Mono) {
                 Ok(d) => d,
-                Err(e) => {
-                    eprintln!("[AUDIO] Failed to create Opus decoder: {:?}", e);
-                    return;
-                }
+                Err(_) => return,
             };
-            
-            let mut packet_count = 0u64;
 
             while let Some(packet) = packet_rx.recv().await {
-                packet_count += 1;
-                if packet_count == 1 {
-                    eprintln!("[AUDIO] Received first audio packet ({} bytes)", packet.len());
-                } else if packet_count % 500 == 0 {
-                    eprintln!("[AUDIO] Received {} packets", packet_count);
-                }
-                
                 let mut output = [0.0f32; 1920]; // 40ms at 48k
-                match decoder.decode_float(Some(&packet), &mut output[..], false) {
-                    Ok(len) => {
-                        let decoded_frames = &output[..len];
-                        // Resample if needed
-                        let resampled = resampler.process(decoded_frames);
-                        
-                        if let Ok(mut buffer) = buffer_for_decode.lock() {
-                            buffer.extend(resampled);
-                            // Prevent bufferbloat / drift
-                            if buffer.len() > max_buffer_samples {
-                                let drain_count = buffer.len() - max_buffer_samples;
-                                buffer.drain(0..drain_count);
-                            }
+                if let Ok(len) = decoder.decode_float(Some(&packet), &mut output[..], false) {
+                    let decoded_frames = &output[..len];
+                    // Resample if needed
+                    let resampled = resampler.process(decoded_frames);
+                    
+                    if let Ok(mut buffer) = buffer_for_decode.lock() {
+                        buffer.extend(resampled);
+                        // Prevent bufferbloat / drift
+                        if buffer.len() > max_buffer_samples {
+                            let drain_count = buffer.len() - max_buffer_samples;
+                            buffer.drain(0..drain_count);
                         }
-                    },
-                    Err(e) => {
-                        if packet_count <= 5 {
-                            eprintln!("[AUDIO] Decode error: {:?}", e);
-                        }
-                    },
+                    }
                 }
             }
-            eprintln!("[AUDIO] Decode loop ended after {} packets", packet_count);
         });
 
         // Setup CPAL Output Stream with proper error handling
         let error_tx_for_output = self.error_tx.clone();
         let err_fn = move |err: StreamError| {
-            eprintln!("[AUDIO] Output stream error: {:?}", err);
             if let Some(tx) = &error_tx_for_output {
                 let _ = tx.send(AudioDeviceError::OutputDeviceError(format!("{:?}", err)));
             }
@@ -261,7 +228,6 @@ impl AudioEngine {
 
         stream.play()?;
         self.output_streams.push(SendStream(stream));
-        eprintln!("[AUDIO] Playback stream started successfully (total: {})", self.output_streams.len());
         Ok(())
     }
 
@@ -338,7 +304,6 @@ impl AudioEngine {
         // Setup CPAL Input Stream with proper error handling
         let error_tx_for_input = self.error_tx.clone();
         let err_fn = move |err: StreamError| {
-            eprintln!("[AUDIO] Input stream error: {:?}", err);
             if let Some(tx) = &error_tx_for_input {
                 let _ = tx.send(AudioDeviceError::InputDeviceError(format!("{:?}", err)));
             }
@@ -347,13 +312,15 @@ impl AudioEngine {
         let stream = device.build_input_stream(
             &stream_config,
             move |data: &[f32], _: &_| {
-                // Downmix to Mono if needed
+                // Downmix to Mono if needed - proper averaging across channels
                 let channels = config.channels() as usize;
                 if channels == 1 {
                     let _ = raw_tx.send(data.to_vec());
                 } else {
-                    // Take every Nth sample (decimation)
-                    let mono: Vec<f32> = data.iter().step_by(channels).cloned().collect();
+                    // Average all channels together for proper mono conversion
+                    let mono: Vec<f32> = data.chunks(channels)
+                        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+                        .collect();
                     let _ = raw_tx.send(mono);
                 }
             },

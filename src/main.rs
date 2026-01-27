@@ -411,7 +411,9 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
         }
 
         // Handle Voice Events - ALL voice state changes happen here
-        if let Ok(event) = voice_event_rx.try_recv() {
+        // CRITICAL: Drain ALL pending events to avoid race conditions
+        // (e.g., user typing :vc before Disconnected event is processed)
+        while let Ok(event) = voice_event_rx.try_recv() {
             match event {
                 VoiceEvent::Signal { target_id, signal_type, data } => {
                     // Send this signal to the server via WebSocket
@@ -453,17 +455,14 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                 }
                 VoiceEvent::PeerConnected(peer_id) => {
                     if !app.voice.connected_peers.contains(&peer_id) {
-                        app.voice.connected_peers.push(peer_id.clone());
+                        app.voice.connected_peers.push(peer_id);
                     }
-                    eprintln!("[MAIN] Peer connected: {}", peer_id);
                 }
                 VoiceEvent::PeerDisconnected(peer_id) => {
                     app.voice.connected_peers.retain(|p| p != &peer_id);
-                    eprintln!("[MAIN] Peer disconnected: {}", peer_id);
                 }
                 VoiceEvent::PeerConnectionFailed(peer_id) => {
                     app.voice.connected_peers.retain(|p| p != &peer_id);
-                    eprintln!("[MAIN] Peer connection failed: {}", peer_id);
                 }
                 VoiceEvent::MuteStateChanged(muted) => {
                     app.voice.is_muted = muted;
@@ -1937,25 +1936,17 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             )));
         }
         ServerMessage::VoiceSignal(payload) => {
-            eprintln!("[MAIN] Received VoiceSignal: type={}, sender={:?}, voice_status={:?}", 
-                payload.signal_type, payload.sender_username, app.voice.status);
-            
             // Forward signals to VoiceManager regardless of local state
             // The VoiceManager has its own is_joined flag and will handle appropriately
             // This fixes the race condition where signals arrive before Connected event
             if let Some(voice_tx) = &app.voice_tx {
                 if let (Some(sender_id), Some(_sender_username)) = (payload.sender_user_id, payload.sender_username) {
-                    eprintln!("[MAIN] Forwarding signal to VoiceManager: type={}, sender_id={}", payload.signal_type, sender_id);
                     let _ = voice_tx.send(voice::manager::VoiceCommand::Signal {
                         sender_id,
                         signal_type: payload.signal_type,
                         data: payload.data,
                     });
-                } else {
-                    eprintln!("[MAIN] Missing sender_id or sender_username in payload");
                 }
-            } else {
-                eprintln!("[MAIN] voice_tx is None");
             }
         }
         ServerMessage::VoiceState(payload) => {
@@ -1963,7 +1954,6 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             // Do NOT derive voice.status from this - that comes from VoiceEvent handlers
             if Some(payload.room_id) == app.room_id {
                 app.voice.room_users = payload.active_users;
-                eprintln!("[MAIN] VoiceState updated: room_users={:?}", app.voice.room_users);
             }
         }
     }

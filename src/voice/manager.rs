@@ -137,7 +137,6 @@ impl VoiceManager {
                         AudioDeviceError::OutputDeviceError(e) => format!("Output device error: {}", e),
                         AudioDeviceError::InputDeviceError(e) => format!("Input device error: {}", e),
                     };
-                    eprintln!("[VOICE] Audio error: {}", err_msg);
                     let _ = self.event_tx.send(VoiceEvent::AudioError(err_msg));
                 }
                 else => break,
@@ -146,8 +145,6 @@ impl VoiceManager {
     }
 
     async fn join_voice(&mut self, room_id: String) -> Result<()> {
-        eprintln!("[VOICE] join_voice called for room: {}", room_id);
-        
         // Send Connecting event immediately
         let _ = self.event_tx.send(VoiceEvent::Connecting);
         
@@ -167,13 +164,11 @@ impl VoiceManager {
             let mut audio = self.audio_engine.lock().await;
             if let Err(e) = audio.start_capture(encoded_tx) {
                 let err_msg = format!("Failed to start microphone: {}", e);
-                eprintln!("[VOICE] {}", err_msg);
                 self.is_joined.store(false, Ordering::Relaxed);
                 self.room_id = None;
                 let _ = self.event_tx.send(VoiceEvent::ConnectionFailed(err_msg));
                 return Err(anyhow::anyhow!("Microphone capture failed"));
             }
-            eprintln!("[VOICE] Microphone capture started");
         }
 
         // 2. Create Local Track
@@ -220,7 +215,6 @@ impl VoiceManager {
         
         // Send Connected event - audio is ready
         let _ = self.event_tx.send(VoiceEvent::Connected);
-        eprintln!("[VOICE] Successfully joined voice in room {}", room_id);
         
         Ok(())
     }
@@ -279,7 +273,6 @@ impl VoiceManager {
             let tx = event_tx_for_pc_state.clone();
             let peer_id = remote_id_for_pc_state.clone();
             Box::pin(async move {
-                eprintln!("[VOICE] Peer {} connection state changed: {:?}", peer_id, state);
                 match state {
                     RTCPeerConnectionState::Connected => {
                         let _ = tx.send(VoiceEvent::PeerConnected(peer_id));
@@ -296,12 +289,9 @@ impl VoiceManager {
         }));
 
         // Monitor ICE connection state changes
-        let remote_id_for_ice = remote_user_id.clone();
-        pc.on_ice_connection_state_change(Box::new(move |state| {
-            let peer_id = remote_id_for_ice.clone();
+        pc.on_ice_connection_state_change(Box::new(move |_state| {
             Box::pin(async move {
-                eprintln!("[VOICE] Peer {} ICE state changed: {:?}", peer_id, state);
-                // Just log for now - peer_connection_state_change handles events
+                // ICE state changes are handled by peer_connection_state_change
             })
         }));
 
@@ -316,10 +306,7 @@ impl VoiceManager {
             let event_tx = event_tx_clone.clone();
             let peer_id = remote_user_for_track.clone();
             Box::pin(async move {
-                eprintln!("[VOICE] on_track fired for peer: {}", peer_id);
-                
                 if !joined_state.load(Ordering::Relaxed) {
-                    eprintln!("[VOICE] Ignoring track - not joined");
                     return;
                 }
                 let (packet_tx, packet_rx) = mpsc::unbounded_channel();
@@ -327,25 +314,16 @@ impl VoiceManager {
                 // Start playback thread for this track
                 {
                     let mut engine = audio_engine.lock().await;
-                    eprintln!("[VOICE] Starting playback for peer: {}", peer_id);
                     if let Err(e) = engine.start_playback(packet_rx) {
-                        eprintln!("[VOICE] Audio playback failed for {}: {}", peer_id, e);
                         let _ = event_tx.send(VoiceEvent::AudioError(format!("Audio playback failed: {}", e)));
                         return;
                     }
-                    eprintln!("[VOICE] Playback started successfully for peer: {}", peer_id);
                 }
 
                 // Loop reading RTP packets
-                let mut rtp_count = 0u64;
                 while let Ok((rtp, _attr)) = track.read_rtp().await {
-                    rtp_count += 1;
-                    if rtp_count == 1 {
-                        eprintln!("[VOICE] First RTP packet from {} ({} bytes payload)", peer_id, rtp.payload.len());
-                    }
                     let _ = packet_tx.send(rtp.payload.to_vec());
                 }
-                eprintln!("[VOICE] RTP loop ended for {} after {} packets", peer_id, rtp_count);
             })
         }));
 
@@ -370,8 +348,6 @@ impl VoiceManager {
     }
 
     async fn leave_voice(&mut self) -> Result<()> {
-        eprintln!("[VOICE] leave_voice called");
-        
         // Set joined flag to false FIRST to stop on_track callbacks
         self.is_joined.store(false, Ordering::Relaxed);
         
@@ -397,7 +373,6 @@ impl VoiceManager {
         {
             let mut peers = self.peers.lock().await;
             for (peer_id, pc) in peers.drain() {
-                eprintln!("[VOICE] Closing peer connection to {}", peer_id);
                 // Close synchronously to ensure cleanup completes
                 let _ = pc.close().await;
                 let _ = self.event_tx.send(VoiceEvent::PeerDisconnected(peer_id));
@@ -413,30 +388,17 @@ impl VoiceManager {
         let _ = self.event_tx.send(VoiceEvent::TxActivity(false));
         let _ = self.event_tx.send(VoiceEvent::MuteStateChanged(false));
         let _ = self.event_tx.send(VoiceEvent::Disconnected);
-        eprintln!("[VOICE] leave_voice completed");
         
         Ok(())
     }
 
     pub async fn handle_signal(&mut self, sender_id: &str, signal_type: &str, data: &str) -> Result<()> {
-        eprintln!("[VOICE] handle_signal: type={}, sender={}, is_joined={}", 
-            signal_type, sender_id, self.is_joined.load(Ordering::Relaxed));
-        
         match signal_type {
             "join_voice" => {
-                eprintln!("[VOICE] Peer {} joined voice, creating peer connection with offer", sender_id);
-                // Remote user joined, we connect to them (Host/Client logic needed to avoid double connection)
-                // Simplest: Use ID comparison. If my_id < their_id, I initiate.
-                // But I don't have my_id easily here (it's in App).
-                // Alternative: "join_voice" just means "I am here". 
-                // Let's assume the EXISTING users initiate connections to the NEW user.
-                match self.create_peer_connection(sender_id.to_string(), true).await {
-                    Ok(_) => eprintln!("[VOICE] Peer connection created successfully for {}", sender_id),
-                    Err(e) => eprintln!("[VOICE] Failed to create peer connection for {}: {}", sender_id, e),
-                }
+                // Remote user joined - existing users initiate connections to the new user
+                let _ = self.create_peer_connection(sender_id.to_string(), true).await;
             }
             "offer" => {
-                eprintln!("[VOICE] Received offer from {}", sender_id);
                 let pc = self.create_peer_connection(sender_id.to_string(), false).await?;
                 let desc: RTCSessionDescription = serde_json::from_str(data)?;
                 pc.set_remote_description(desc).await?;
@@ -445,7 +407,6 @@ impl VoiceManager {
                 pc.set_local_description(answer.clone()).await?;
                 
                 if let Ok(json) = serde_json::to_string(&answer) {
-                    eprintln!("[VOICE] Sending answer to {}", sender_id);
                     self.event_tx.send(VoiceEvent::Signal {
                         target_id: Some(sender_id.to_string()),
                         signal_type: "answer".to_string(),
@@ -454,37 +415,27 @@ impl VoiceManager {
                 }
             }
             "answer" => {
-                eprintln!("[VOICE] Received answer from {}", sender_id);
                 let peers = self.peers.lock().await;
                 if let Some(pc) = peers.get(sender_id) {
                     let desc: RTCSessionDescription = serde_json::from_str(data)?;
                     pc.set_remote_description(desc).await?;
-                    eprintln!("[VOICE] Set remote description for {}", sender_id);
-                } else {
-                    eprintln!("[VOICE] No peer connection found for {}", sender_id);
                 }
             }
             "candidate" => {
-                eprintln!("[VOICE] Received ICE candidate from {}", sender_id);
                 let peers = self.peers.lock().await;
                 if let Some(pc) = peers.get(sender_id) {
                     let candidate: RTCIceCandidateInit = serde_json::from_str(data)?;
                     pc.add_ice_candidate(candidate).await?;
-                } else {
-                    eprintln!("[VOICE] No peer connection found for {} to add candidate", sender_id);
                 }
             }
             "leave_voice" => {
-                eprintln!("[VOICE] Peer {} left voice", sender_id);
                 let mut peers = self.peers.lock().await;
                 if let Some(pc) = peers.remove(sender_id) {
                     let _ = pc.close().await;
                 }
                 let _ = self.event_tx.send(VoiceEvent::PeerDisconnected(sender_id.to_string()));
             }
-            _ => {
-                eprintln!("[VOICE] Unknown signal type: {}", signal_type);
-            }
+            _ => {}
         }
         Ok(())
     }
