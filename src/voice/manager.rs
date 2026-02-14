@@ -155,6 +155,14 @@ impl VoiceManager {
         }
         self.local_track = None;
         
+        // Close any existing peer connections from previous session
+        {
+            let mut peers = self.peers.lock().await;
+            for (_, pc) in peers.drain() {
+                let _ = pc.close().await;
+            }
+        }
+        
         self.room_id = Some(room_id.clone());
         self.is_joined.store(true, Ordering::Relaxed);
         
@@ -220,6 +228,15 @@ impl VoiceManager {
     }
 
     async fn create_peer_connection(&self, remote_user_id: String, initiate_offer: bool) -> Result<Arc<RTCPeerConnection>> {
+        // Close any existing peer connection to this user first
+        // This handles the case where a user leaves and rejoins quickly
+        {
+            let mut peers = self.peers.lock().await;
+            if let Some(old_pc) = peers.remove(&remote_user_id) {
+                let _ = old_pc.close().await;
+            }
+        }
+        
         // Setup Media Engine
         let mut m = MediaEngine::default();
         m.register_default_codecs()?;
