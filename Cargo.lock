@@ -1244,7 +1244,7 @@ checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
 name = "eurus"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aead",
  "aes-gcm",
