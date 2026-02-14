@@ -5,6 +5,7 @@ mod config;
 mod vim;
 mod emoji;
 mod voice;
+mod ssh;
 
 use crate::crypto::{decrypt, encrypt, key_from_hex, AesKey};
 use crate::clipboard::ClipboardManager;
@@ -38,6 +39,10 @@ enum CurrentScreen {
     KeySelection,         // Select SSH key from list
     UsernameInput,        // Enter username
     RegistrationSuccess,  // Show token + success
+    
+    // Re-authentication flow
+    ReAuthenticate,       // Challenge-response re-auth for existing users
+    PassphraseInput,      // Enter passphrase for encrypted key
     
     // Main flow
     RoomChoice,
@@ -200,12 +205,15 @@ struct App<'a> {
     // Command Mode
     command_input: Option<String>,
     
-    // Registration
-    available_keys: Vec<(String, String)>,  // (path, content)
+    // Registration / Re-authentication
+    available_keys: Vec<ssh::SshKey>,
     selected_key_index: usize,
+    using_agent: bool,  // Whether keys are from ssh-agent
     username_input: TextArea<'a>,
+    passphrase_input: TextArea<'a>,
     registration_token: Option<String>,
     registration_error: Option<String>,
+    pending_challenge: Option<String>,  // Challenge from server during re-auth
     
     // Emoji Picker
     emoji_picker_active: bool,
@@ -268,14 +276,23 @@ impl<'a> Default for App<'a> {
             command_input: None,
             available_keys: Vec::new(),
             selected_key_index: 0,
+            using_agent: false,
             username_input: {
                 let mut input = TextArea::default();
                 input.set_placeholder_text("Enter your username...");
                 input.set_block(Block::default().borders(Borders::ALL).title("Username"));
                 input
             },
+            passphrase_input: {
+                let mut input = TextArea::default();
+                input.set_placeholder_text("Enter passphrase...");
+                input.set_block(Block::default().borders(Borders::ALL).title("Passphrase"));
+                input.set_mask_char('\u{2022}'); // Bullet character to hide passphrase
+                input
+            },
             registration_token: None,
             registration_error: None,
+            pending_challenge: None,
             
             emoji_picker_active: false,
             emoji_matches: Vec::new(),
@@ -314,22 +331,50 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
 
     // Check if user is registered (has auth token)
     let token = load_auth_token(&app.config.auth.token_path);
-    let token_exists = token.is_some();
+    let mut token_exists = token.is_some();
     
     if let Some(t) = &token {
         app.current_username = extract_username_from_token(t);
+        
+        // Check if token is expiring soon (within 24 hours) and try to refresh
+        if let Some(exp) = get_token_expiry(t) {
+            let now = chrono::Utc::now().timestamp();
+            let hours_until_expiry = (exp - now) / 3600;
+            
+            if hours_until_expiry < 24 && hours_until_expiry > 0 {
+                // Token expires in less than 24 hours, try to refresh silently
+                match refresh_token(&app.config.server.url, t).await {
+                    Ok(new_token) => {
+                        if let Err(e) = save_auth_token(&new_token) {
+                            // Log but don't fail - old token still works
+                            eprintln!("Warning: Failed to save refreshed token: {}", e);
+                        }
+                        app.current_username = extract_username_from_token(&new_token);
+                    }
+                    Err(_) => {
+                        // Silent failure - old token still works for now
+                    }
+                }
+            } else if hours_until_expiry <= 0 {
+                // Token has expired, need to re-authenticate
+                token_exists = false;
+            }
+        }
     }
     
     if !token_exists {
-        // No token found - need to register
-        app.available_keys = scan_ssh_keys();
+        // No token found - need to register or re-authenticate
+        let (keys, from_agent) = ssh::get_available_keys();
+        app.available_keys = keys;
+        app.using_agent = from_agent;
         if app.available_keys.is_empty() {
             app.current_screen = CurrentScreen::Registration;
             app.status_message = "No SSH keys found. Create one to register.".to_string();
         } else {
             app.current_screen = CurrentScreen::KeySelection;
             app.selected_key_index = 0;
-            app.status_message = "Welcome! Select an SSH key to register.".to_string();
+            let source = if from_agent { "ssh-agent" } else { "~/.ssh" };
+            app.status_message = format!("Welcome! Select an SSH key ({}).", source);
         }
     } else {
         // Token exists - establish WebSocket connection
@@ -532,6 +577,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                         CurrentScreen::UsernameInput => handle_username_input_screen(app, key).await,
                         CurrentScreen::RegistrationSuccess => handle_registration_success_screen(app, key).await,
                         
+                        // Re-authentication screens
+                        CurrentScreen::ReAuthenticate => handle_re_authenticate_screen(app, key).await,
+                        CurrentScreen::PassphraseInput => handle_passphrase_input_screen(app, key).await,
+                        
                         // Main screens
                         CurrentScreen::RoomChoice => handle_room_choice_screen(app, key).await,
                         CurrentScreen::RoomList => handle_room_list_screen(app, key, ws_incoming_tx.clone()).await,
@@ -575,11 +624,14 @@ async fn handle_registration_screen(app: &mut App<'_>, key: event::KeyEvent) {
         }
         KeyCode::Char('r') | KeyCode::Char('R') => {
             // Retry scanning for keys
-            app.available_keys = scan_ssh_keys();
+            let (keys, from_agent) = ssh::get_available_keys();
+            app.available_keys = keys;
+            app.using_agent = from_agent;
             if !app.available_keys.is_empty() {
                 app.current_screen = CurrentScreen::KeySelection;
                 app.selected_key_index = 0;
-                app.status_message = "Select SSH key to use for registration".to_string();
+                let source = if from_agent { "ssh-agent" } else { "~/.ssh" };
+                app.status_message = format!("Select SSH key ({}).", source);
             } else {
                 app.status_message = "Still no SSH keys found. Create one first.".to_string();
             }
@@ -625,26 +677,110 @@ async fn handle_username_input_screen(app: &mut App<'_>, key: event::KeyEvent) {
             }
             
             // Get selected key
-            if let Some((_, public_key)) = app.available_keys.get(app.selected_key_index) {
-                let public_key = public_key.clone();
+            if let Some(ssh_key) = app.available_keys.get(app.selected_key_index).cloned() {
+                let public_key = ssh_key.public_key.clone();
                 
-                // Perform registration
-                app.status_message = "Registering...".to_string();
+                // First check if user already exists
+                app.status_message = "Checking username...".to_string();
                 
-                match register_user(&app.config.server.url, &username, &public_key).await {
-                    Ok(token) => {
-                        // Save token
-                        if let Err(e) = save_auth_token(&token) {
-                            app.registration_error = Some(format!("Failed to save token: {}", e));
+                match check_user_exists(&app.config.server.url, &username).await {
+                    Ok((true, Some(server_key_type))) => {
+                        // User exists - need to re-authenticate
+                        // Check if selected key type matches
+                        if ssh_key.key_type != server_key_type {
+                            app.status_message = format!(
+                                "Key mismatch: server has {} key, you selected {} key",
+                                server_key_type, ssh_key.key_type
+                            );
+                            return;
                         }
-                        app.current_username = extract_username_from_token(&token);
-                        app.registration_token = Some(token);
-                        app.current_screen = CurrentScreen::RegistrationSuccess;
-                        app.status_message = "Registration successful!".to_string();
+                        
+                        // Request challenge from server
+                        app.status_message = "Welcome back! Authenticating...".to_string();
+                        
+                        match request_challenge(&app.config.server.url, &username).await {
+                            Ok(challenge) => {
+                                // Store challenge for signing
+                                app.pending_challenge = Some(challenge.clone());
+                                
+                                // Decode challenge (it's hex-encoded)
+                                let challenge_bytes = match hex::decode(&challenge) {
+                                    Ok(b) => b,
+                                    Err(_) => {
+                                        app.status_message = "Invalid challenge from server".to_string();
+                                        return;
+                                    }
+                                };
+                                
+                                // Try to sign the challenge
+                                match ssh::sign_challenge(&ssh_key, &challenge_bytes, None) {
+                                    Ok(signature) => {
+                                        // Sign successful, verify with server
+                                        let sig_hex = hex::encode(&signature);
+                                        
+                                        match verify_challenge(
+                                            &app.config.server.url,
+                                            &username,
+                                            &sig_hex,
+                                            &public_key,
+                                        ).await {
+                                            Ok(token) => {
+                                                // Success! Save token and proceed
+                                                if let Err(e) = save_auth_token(&token) {
+                                                    app.registration_error = Some(format!("Failed to save token: {}", e));
+                                                }
+                                                app.current_username = extract_username_from_token(&token);
+                                                app.registration_token = Some(token);
+                                                app.current_screen = CurrentScreen::RegistrationSuccess;
+                                                app.status_message = "Re-authentication successful!".to_string();
+                                            }
+                                            Err(e) => {
+                                                app.status_message = format!("Authentication failed: {}", e);
+                                            }
+                                        }
+                                    }
+                                    Err(ssh::SignError::NeedsPassphrase) => {
+                                        // Key is encrypted, need passphrase
+                                        app.current_screen = CurrentScreen::PassphraseInput;
+                                        app.status_message = "Enter passphrase for encrypted key".to_string();
+                                    }
+                                    Err(e) => {
+                                        app.status_message = format!("Signing failed: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                app.status_message = format!("Failed to get challenge: {}", e);
+                            }
+                        }
+                    }
+                    Ok((true, None)) => {
+                        // User exists but no key type info (shouldn't happen)
+                        app.status_message = "User exists but key type unknown".to_string();
+                    }
+                    Ok((false, _)) => {
+                        // User doesn't exist - proceed with registration
+                        app.status_message = "Registering...".to_string();
+                        
+                        match register_user(&app.config.server.url, &username, &public_key).await {
+                            Ok(token) => {
+                                // Save token
+                                if let Err(e) = save_auth_token(&token) {
+                                    app.registration_error = Some(format!("Failed to save token: {}", e));
+                                }
+                                app.current_username = extract_username_from_token(&token);
+                                app.registration_token = Some(token);
+                                app.current_screen = CurrentScreen::RegistrationSuccess;
+                                app.status_message = "Registration successful!".to_string();
+                            }
+                            Err(e) => {
+                                app.registration_error = Some(e.to_string());
+                                app.status_message = format!("Registration failed: {}", e);
+                            }
+                        }
                     }
                     Err(e) => {
-                        app.registration_error = Some(e.to_string());
-                        app.status_message = format!("Registration failed: {}", e);
+                        app.status_message = format!("Error: {}", e);
                     }
                 }
             }
@@ -673,6 +809,116 @@ async fn handle_registration_success_screen(app: &mut App<'_>, key: event::KeyEv
             app.command_input = Some(String::new());
         }
         _ => {}
+    }
+}
+
+// Re-authentication screen handler (currently unused - re-auth happens in username input)
+async fn handle_re_authenticate_screen(app: &mut App<'_>, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.current_screen = CurrentScreen::KeySelection;
+            app.pending_challenge = None;
+            app.status_message = "Select SSH key".to_string();
+        }
+        KeyCode::Char(':') => {
+            app.command_input = Some(String::new());
+        }
+        _ => {}
+    }
+}
+
+async fn handle_passphrase_input_screen(app: &mut App<'_>, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Enter => {
+            let passphrase = app.passphrase_input.lines().join("").to_string();
+            let username = app.username_input.lines().join("").trim().to_string();
+            
+            if let Some(ssh_key) = app.available_keys.get(app.selected_key_index).cloned() {
+                if let Some(challenge) = app.pending_challenge.clone() {
+                    // Decode challenge
+                    let challenge_bytes = match hex::decode(&challenge) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            app.status_message = "Invalid challenge".to_string();
+                            return;
+                        }
+                    };
+                    
+                    app.status_message = "Signing...".to_string();
+                    
+                    // Try to sign with passphrase
+                    match ssh::sign_challenge(&ssh_key, &challenge_bytes, Some(&passphrase)) {
+                        Ok(signature) => {
+                            let sig_hex = hex::encode(&signature);
+                            
+                            match verify_challenge(
+                                &app.config.server.url,
+                                &username,
+                                &sig_hex,
+                                &ssh_key.public_key,
+                            ).await {
+                                Ok(token) => {
+                                    if let Err(e) = save_auth_token(&token) {
+                                        app.registration_error = Some(format!("Failed to save token: {}", e));
+                                    }
+                                    app.current_username = extract_username_from_token(&token);
+                                    app.registration_token = Some(token);
+                                    app.current_screen = CurrentScreen::RegistrationSuccess;
+                                    app.status_message = "Re-authentication successful!".to_string();
+                                    
+                                    // Clear sensitive data
+                                    app.pending_challenge = None;
+                                    app.passphrase_input = {
+                                        let mut input = TextArea::default();
+                                        input.set_placeholder_text("Enter passphrase...");
+                                        input.set_block(Block::default().borders(Borders::ALL).title("Passphrase"));
+                                        input.set_mask_char('\u{2022}');
+                                        input
+                                    };
+                                }
+                                Err(e) => {
+                                    app.status_message = format!("Authentication failed: {}", e);
+                                }
+                            }
+                        }
+                        Err(ssh::SignError::Decrypt(_)) => {
+                            app.status_message = "Wrong passphrase. Try again.".to_string();
+                            // Clear passphrase input for retry
+                            app.passphrase_input = {
+                                let mut input = TextArea::default();
+                                input.set_placeholder_text("Enter passphrase...");
+                                input.set_block(Block::default().borders(Borders::ALL).title("Passphrase"));
+                                input.set_mask_char('\u{2022}');
+                                input
+                            };
+                        }
+                        Err(e) => {
+                            app.status_message = format!("Signing failed: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Esc => {
+            // Go back to username input
+            app.current_screen = CurrentScreen::UsernameInput;
+            app.pending_challenge = None;
+            app.status_message = "Enter username".to_string();
+            // Clear passphrase
+            app.passphrase_input = {
+                let mut input = TextArea::default();
+                input.set_placeholder_text("Enter passphrase...");
+                input.set_block(Block::default().borders(Borders::ALL).title("Passphrase"));
+                input.set_mask_char('\u{2022}');
+                input
+            };
+        }
+        KeyCode::Char(':') => {
+            app.command_input = Some(String::new());
+        }
+        _ => {
+            app.passphrase_input.input(Event::Key(key));
+        }
     }
 }
 
@@ -1508,14 +1754,17 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
         }
         // Register command
         "register" | "reg" => {
-            app.available_keys = scan_ssh_keys();
+            let (keys, from_agent) = ssh::get_available_keys();
+            app.available_keys = keys;
+            app.using_agent = from_agent;
             if app.available_keys.is_empty() {
                 app.current_screen = CurrentScreen::Registration;
                 app.status_message = "No SSH keys found".to_string();
             } else {
                 app.current_screen = CurrentScreen::KeySelection;
                 app.selected_key_index = 0;
-                app.status_message = "Select SSH key to use for registration".to_string();
+                let source = if from_agent { "ssh-agent" } else { "~/.ssh" };
+                app.status_message = format!("Select SSH key ({}).", source);
             }
         }
         // Share/Invite command
@@ -2014,47 +2263,6 @@ fn load_auth_token(token_path: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-fn scan_ssh_keys() -> Vec<(String, String)> {
-    use std::fs;
-    
-    let ssh_dir = dirs::home_dir()
-        .map(|h| h.join(".ssh"))
-        .unwrap_or_else(|| std::path::PathBuf::from("~/.ssh"));
-    
-    let mut keys = Vec::new();
-    
-    if let Ok(entries) = fs::read_dir(&ssh_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(ext) = path.extension() {
-                if ext == "pub" {
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        let content = content.trim().to_string();
-                        if content.starts_with("ssh-ed25519") || content.starts_with("ssh-rsa") {
-                            let path_str = path.to_string_lossy().to_string();
-                            keys.push((path_str, content));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // Sort: ed25519 keys first, then alphabetically
-    keys.sort_by(|a, b| {
-        let a_is_ed25519 = a.1.starts_with("ssh-ed25519");
-        let b_is_ed25519 = b.1.starts_with("ssh-ed25519");
-        
-        match (a_is_ed25519, b_is_ed25519) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.0.cmp(&b.0),
-        }
-    });
-    
-    keys
-}
-
 fn detect_key_type(public_key: &str) -> Option<&'static str> {
     if public_key.starts_with("ssh-ed25519") {
         Some("ed25519")
@@ -2122,6 +2330,197 @@ async fn register_user(server_url: &str, username: &str, public_key: &str) -> Re
     }
     
     let result: RegisterResponse = response.json().await?;
+    Ok(result.token)
+}
+
+/// Extract token expiry timestamp from JWT
+fn get_token_expiry(token: &str) -> Option<i64> {
+    // JWT format: header.payload.signature
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+
+    // Decode the payload (base64url)
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let payload = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let payload_str = String::from_utf8(payload).ok()?;
+
+    // Parse JSON and extract exp field
+    let json: serde_json::Value = serde_json::from_str(&payload_str).ok()?;
+    json.get("exp")?.as_i64()
+}
+
+/// Refresh an auth token using the server's refresh endpoint
+async fn refresh_token(server_url: &str, current_token: &str) -> Result<String, Box<dyn Error>> {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct RefreshResponse {
+        token: String,
+    }
+
+    #[derive(Deserialize)]
+    struct ErrorResponse {
+        error: String,
+    }
+
+    // Convert WebSocket URL to HTTP URL
+    let api_url = server_url
+        .replace("wss://", "https://")
+        .replace("ws://", "http://")
+        .replace("/ws", "");
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/api/auth/refresh", api_url))
+        .header("Authorization", format!("Bearer {}", current_token))
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let error: ErrorResponse = response.json().await.unwrap_or(ErrorResponse {
+            error: "Token refresh failed".to_string(),
+        });
+        return Err(error.error.into());
+    }
+
+    let result: RefreshResponse = response.json().await?;
+    Ok(result.token)
+}
+
+/// Check if a username already exists on the server
+async fn check_user_exists(server_url: &str, username: &str) -> Result<(bool, Option<String>), Box<dyn Error>> {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct ExistsResponse {
+        exists: bool,
+        #[serde(rename = "keyType")]
+        key_type: Option<String>,
+    }
+
+    // Convert WebSocket URL to HTTP URL
+    let api_url = server_url
+        .replace("wss://", "https://")
+        .replace("ws://", "http://")
+        .replace("/ws", "");
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{}/api/auth/exists/{}", api_url, username))
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err("Failed to check user existence".into());
+    }
+
+    let result: ExistsResponse = response.json().await?;
+    Ok((result.exists, result.key_type))
+}
+
+/// Request a challenge from the server for authentication
+async fn request_challenge(server_url: &str, username: &str) -> Result<String, Box<dyn Error>> {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize)]
+    struct ChallengeRequest {
+        username: String,
+    }
+
+    #[derive(Deserialize)]
+    struct ChallengeResponse {
+        challenge: String,
+    }
+
+    #[derive(Deserialize)]
+    struct ErrorResponse {
+        error: String,
+    }
+
+    // Convert WebSocket URL to HTTP URL
+    let api_url = server_url
+        .replace("wss://", "https://")
+        .replace("ws://", "http://")
+        .replace("/ws", "");
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/api/auth/challenge", api_url))
+        .json(&ChallengeRequest {
+            username: username.to_string(),
+        })
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let error: ErrorResponse = response.json().await.unwrap_or(ErrorResponse {
+            error: "Failed to get challenge".to_string(),
+        });
+        return Err(error.error.into());
+    }
+
+    let result: ChallengeResponse = response.json().await?;
+    Ok(result.challenge)
+}
+
+/// Verify a signed challenge with the server
+async fn verify_challenge(
+    server_url: &str,
+    username: &str,
+    signature: &str,
+    public_key: &str,
+) -> Result<String, Box<dyn Error>> {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize)]
+    struct VerifyRequest {
+        username: String,
+        signature: String,
+        #[serde(rename = "publicKey")]
+        public_key: String,
+    }
+
+    #[derive(Deserialize)]
+    struct VerifyResponse {
+        token: String,
+        #[serde(rename = "userId")]
+        _user_id: String,
+        #[serde(rename = "username")]
+        _username: String,
+    }
+
+    #[derive(Deserialize)]
+    struct ErrorResponse {
+        error: String,
+    }
+
+    // Convert WebSocket URL to HTTP URL
+    let api_url = server_url
+        .replace("wss://", "https://")
+        .replace("ws://", "http://")
+        .replace("/ws", "");
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/api/auth/verify", api_url))
+        .json(&VerifyRequest {
+            username: username.to_string(),
+            signature: signature.to_string(),
+            public_key: public_key.to_string(),
+        })
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let error: ErrorResponse = response.json().await.unwrap_or(ErrorResponse {
+            error: "Challenge verification failed".to_string(),
+        });
+        return Err(error.error.into());
+    }
+
+    let result: VerifyResponse = response.json().await?;
     Ok(result.token)
 }
 
@@ -2345,6 +2744,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         CurrentScreen::KeySelection => render_key_selection(f, app, main_area),
         CurrentScreen::UsernameInput => render_username_input(f, app, main_area),
         CurrentScreen::RegistrationSuccess => render_registration_success(f, app, main_area),
+        
+        // Re-authentication screens
+        CurrentScreen::ReAuthenticate => render_re_authenticate(f, app, main_area),
+        CurrentScreen::PassphraseInput => render_passphrase_input(f, app, main_area),
         
         // Main screens
         CurrentScreen::RoomChoice => render_room_choice(f, main_area),
@@ -2951,17 +3354,13 @@ fn render_key_selection(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app.available_keys
         .iter()
         .enumerate()
-        .map(|(i, (path, content))| {
-            // Extract key type and truncate the key
-            let key_type = if content.starts_with("ssh-ed25519") {
-                "ed25519"
-            } else {
-                "rsa"
+        .map(|(i, ssh_key)| {
+            // Show source indicator for agent keys
+            let source_icon = match &ssh_key.source {
+                ssh::KeySource::Agent => "[agent] ",
+                ssh::KeySource::File(_) => "",
             };
-            
-            // Get filename from path
-            let filename = path.split('/').last().unwrap_or(path);
-            let display = format!("{} ({})", filename, key_type);
+            let display = format!("{}{} ({})", source_icon, ssh_key.name, ssh_key.key_type);
             
             let style = if i == app.selected_key_index {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -2973,10 +3372,16 @@ fn render_key_selection(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     
+    let title = if app.using_agent {
+        "Select SSH Key (from ssh-agent) - [j/k] Navigate [Enter] Select [q] Quit"
+    } else {
+        "Select SSH Key (from ~/.ssh) - [j/k] Navigate [Enter] Select [q] Quit"
+    };
+    
     let list = List::new(items)
         .block(Block::default()
             .borders(Borders::ALL)
-            .title("Select SSH Key - [j/k] Navigate [Enter] Select [q] Quit")
+            .title(title)
             .border_style(Style::default().fg(Color::Cyan)));
     
     f.render_widget(list, area);
@@ -2994,9 +3399,12 @@ fn render_username_input(f: &mut Frame, app: &mut App, area: Rect) {
         .split(area);
     
     // Show selected key info
-    let key_info = if let Some((path, _)) = app.available_keys.get(app.selected_key_index) {
-        let filename = path.split('/').last().unwrap_or(path);
-        format!("Using key: {}", filename)
+    let key_info = if let Some(ssh_key) = app.available_keys.get(app.selected_key_index) {
+        let source = match &ssh_key.source {
+            ssh::KeySource::Agent => "ssh-agent",
+            ssh::KeySource::File(_) => "file",
+        };
+        format!("Using key: {} ({}, {})", ssh_key.name, ssh_key.key_type, source)
     } else {
         "No key selected".to_string()
     };
@@ -3049,6 +3457,70 @@ fn render_registration_success(f: &mut Frame, app: &App, area: Rect) {
             .title("Registration Complete")
             .border_style(Style::default().fg(Color::Green)));
     f.render_widget(paragraph, area);
+}
+
+fn render_re_authenticate(f: &mut Frame, app: &App, area: Rect) {
+    let username = app.username_input.lines().join("");
+    let key_info = app.available_keys.get(app.selected_key_index)
+        .map(|k| format!("{} ({})", k.name, k.key_type))
+        .unwrap_or_else(|| "None".to_string());
+    
+    let text = Text::from(vec![
+        Line::from(""),
+        Line::from("Re-Authentication Required").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Line::from(""),
+        Line::from(format!("Username: {}", username)).style(Style::default().fg(Color::Cyan)),
+        Line::from(format!("Key: {}", key_info)).style(Style::default().fg(Color::Green)),
+        Line::from(""),
+        Line::from("Your account exists. Please wait while we verify your identity..."),
+        Line::from(""),
+    ]);
+    
+    let paragraph = Paragraph::new(text)
+        .alignment(Alignment::Center)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("Re-Authentication")
+            .border_style(Style::default().fg(Color::Yellow)));
+    f.render_widget(paragraph, area);
+}
+
+fn render_passphrase_input(f: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),  // Info
+            Constraint::Length(3),  // Passphrase input
+            Constraint::Min(1),     // Help
+        ])
+        .margin(2)
+        .split(area);
+    
+    // Show key info
+    let key_info = if let Some(ssh_key) = app.available_keys.get(app.selected_key_index) {
+        let source = match &ssh_key.source {
+            ssh::KeySource::Agent => "ssh-agent",
+            ssh::KeySource::File(_) => "file",
+        };
+        format!("Key: {} ({}, {})\nThis key is encrypted.", ssh_key.name, ssh_key.key_type, source)
+    } else {
+        "No key selected".to_string()
+    };
+    
+    let info = Paragraph::new(key_info)
+        .style(Style::default().fg(Color::Yellow))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title("Encrypted Key"));
+    f.render_widget(info, chunks[0]);
+    
+    // Passphrase input
+    f.render_widget(&app.passphrase_input, chunks[1]);
+    
+    // Help text
+    let help = Paragraph::new("Enter the passphrase to decrypt your SSH key.\nPress Enter to continue, Esc to go back.")
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title("Help"));
+    f.render_widget(help, chunks[2]);
 }
 
 fn render_help(f: &mut Frame, area: Rect) {

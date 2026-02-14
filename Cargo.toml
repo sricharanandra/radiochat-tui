@@ -28,6 +28,13 @@ webrtc = "0.10.0"
 cpal = "0.15.2"
 audiopus = "0.2.0-alpha.5"
 anyhow = "1.0"
+ssh-key = { version = "0.6", features = ["ed25519", "rsa", "encryption"] }
+ssh-agent-client-rs = "1.1"
+rpassword = "7.3"
+ed25519-dalek = "2.1"
+rsa = "0.9"
+sha2 = "0.10"
+signature = "2.2"
 
 [profile.release]
 lto = false
