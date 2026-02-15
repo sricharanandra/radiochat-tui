@@ -19,6 +19,12 @@ use webrtc::media::Sample;
 
 use crate::voice::audio::{AudioEngine, AudioDeviceError};
 
+/// Internal commands sent from async callbacks back to the VoiceManager
+enum InternalCmd {
+    /// Peer connection entered Failed/Disconnected/Closed state - clean it up
+    CleanupPeer(String),
+}
+
 /// Voice connection status for UI display
 #[derive(Debug, Clone, PartialEq)]
 pub enum VoiceConnectionStatus {
@@ -78,6 +84,13 @@ pub struct VoiceManager {
     local_track: Option<Arc<TrackLocalStaticSample>>,
     is_muted: Arc<AtomicBool>,
     is_joined: Arc<AtomicBool>,
+    /// Buffered ICE candidates that arrived before the peer connection was created
+    /// FIX for Bug 1: candidates that arrive before the offer are queued here
+    /// and applied once the peer connection is created via the offer handler.
+    pending_candidates: HashMap<String, Vec<RTCIceCandidateInit>>,
+    /// Channel for internal commands from async callbacks (e.g., peer cleanup)
+    internal_tx: mpsc::UnboundedSender<InternalCmd>,
+    internal_rx: Option<mpsc::UnboundedReceiver<InternalCmd>>,
 }
 
 impl VoiceManager {
@@ -89,6 +102,9 @@ impl VoiceManager {
         let mut audio_engine = AudioEngine::new();
         audio_engine.set_error_channel(audio_error_tx);
         
+        // Create internal command channel for async callback -> manager communication
+        let (internal_tx, internal_rx) = mpsc::unbounded_channel::<InternalCmd>();
+        
         Self {
             room_id: None,
             event_tx,
@@ -98,12 +114,16 @@ impl VoiceManager {
             local_track: None,
             is_muted: Arc::new(AtomicBool::new(false)),
             is_joined: Arc::new(AtomicBool::new(false)),
+            pending_candidates: HashMap::new(),
+            internal_tx,
+            internal_rx: Some(internal_rx),
         }
     }
 
     pub async fn run(&mut self, mut command_rx: mpsc::UnboundedReceiver<VoiceCommand>) {
-        // Take ownership of the audio error receiver
+        // Take ownership of the audio error receiver and internal command receiver
         let mut audio_error_rx = self.audio_error_rx.take();
+        let mut internal_rx = self.internal_rx.take();
         
         loop {
             tokio::select! {
@@ -122,6 +142,29 @@ impl VoiceManager {
                         }
                         VoiceCommand::Signal { sender_id, signal_type, data } => {
                             let _ = self.handle_signal(&sender_id, &signal_type, &data).await;
+                        }
+                    }
+                }
+                // Handle internal commands from async callbacks (Bug 5 fix)
+                Some(internal) = async {
+                    if let Some(ref mut rx) = internal_rx {
+                        rx.recv().await
+                    } else {
+                        None
+                    }
+                } => {
+                    match internal {
+                        InternalCmd::CleanupPeer(peer_id) => {
+                            let mut peers = self.peers.lock().await;
+                            if let Some(pc) = peers.remove(&peer_id) {
+                                let _ = pc.close().await;
+                            }
+                            // Also clean up any associated output stream
+                            {
+                                let mut audio = self.audio_engine.lock().await;
+                                audio.remove_peer_stream(&peer_id);
+                            }
+                            self.pending_candidates.remove(&peer_id);
                         }
                     }
                 }
@@ -154,6 +197,7 @@ impl VoiceManager {
             audio.reset();
         }
         self.local_track = None;
+        self.pending_candidates.clear();
         
         // Close any existing peer connections from previous session
         {
@@ -237,6 +281,12 @@ impl VoiceManager {
             }
         }
         
+        // Also clean up any stale output stream for this peer (Bug 4 fix)
+        {
+            let mut audio = self.audio_engine.lock().await;
+            audio.remove_peer_stream(&remote_user_id);
+        }
+        
         // Setup Media Engine
         let mut m = MediaEngine::default();
         m.register_default_codecs()?;
@@ -284,10 +334,14 @@ impl VoiceManager {
         }));
 
         // Monitor peer connection state changes
+        // Bug 5 fix: send InternalCmd::CleanupPeer on failure so the manager
+        // removes the dead PC from its peers map and cleans up the output stream.
         let event_tx_for_pc_state = self.event_tx.clone();
+        let internal_tx_for_pc_state = self.internal_tx.clone();
         let remote_id_for_pc_state = remote_user_id.clone();
         pc.on_peer_connection_state_change(Box::new(move |state| {
             let tx = event_tx_for_pc_state.clone();
+            let itx = internal_tx_for_pc_state.clone();
             let peer_id = remote_id_for_pc_state.clone();
             Box::pin(async move {
                 match state {
@@ -295,10 +349,12 @@ impl VoiceManager {
                         let _ = tx.send(VoiceEvent::PeerConnected(peer_id));
                     }
                     RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Closed => {
-                        let _ = tx.send(VoiceEvent::PeerDisconnected(peer_id));
+                        let _ = tx.send(VoiceEvent::PeerDisconnected(peer_id.clone()));
+                        let _ = itx.send(InternalCmd::CleanupPeer(peer_id));
                     }
                     RTCPeerConnectionState::Failed => {
-                        let _ = tx.send(VoiceEvent::PeerConnectionFailed(peer_id));
+                        let _ = tx.send(VoiceEvent::PeerConnectionFailed(peer_id.clone()));
+                        let _ = itx.send(InternalCmd::CleanupPeer(peer_id));
                     }
                     _ => {}
                 }
@@ -313,6 +369,7 @@ impl VoiceManager {
         }));
 
         // Handle Incoming Tracks (Remote Audio)
+        // Bug 4 fix: pass peer_id so AudioEngine tracks streams per-peer
         let audio_engine_clone = self.audio_engine.clone();
         let is_joined = self.is_joined.clone();
         let event_tx_clone = self.event_tx.clone();
@@ -328,10 +385,10 @@ impl VoiceManager {
                 }
                 let (packet_tx, packet_rx) = mpsc::unbounded_channel();
                 
-                // Start playback thread for this track
+                // Start playback thread for this track, keyed by peer_id
                 {
                     let mut engine = audio_engine.lock().await;
-                    if let Err(e) = engine.start_playback(packet_rx) {
+                    if let Err(e) = engine.start_playback_for_peer(&peer_id, packet_rx) {
                         let _ = event_tx.send(VoiceEvent::AudioError(format!("Audio playback failed: {}", e)));
                         return;
                     }
@@ -386,6 +443,9 @@ impl VoiceManager {
         // Clear local track
         self.local_track = None;
         
+        // Clear pending candidates
+        self.pending_candidates.clear();
+        
         // Close all peers and wait for completion (don't fire-and-forget)
         {
             let mut peers = self.peers.lock().await;
@@ -420,6 +480,13 @@ impl VoiceManager {
                 let desc: RTCSessionDescription = serde_json::from_str(data)?;
                 pc.set_remote_description(desc).await?;
                 
+                // Bug 1 fix: apply any buffered ICE candidates that arrived before the offer
+                if let Some(candidates) = self.pending_candidates.remove(sender_id) {
+                    for candidate in candidates {
+                        let _ = pc.add_ice_candidate(candidate).await;
+                    }
+                }
+                
                 let answer = pc.create_answer(None).await?;
                 pc.set_local_description(answer.clone()).await?;
                 
@@ -441,8 +508,17 @@ impl VoiceManager {
             "candidate" => {
                 let peers = self.peers.lock().await;
                 if let Some(pc) = peers.get(sender_id) {
+                    // Peer connection exists - add candidate directly
                     let candidate: RTCIceCandidateInit = serde_json::from_str(data)?;
                     pc.add_ice_candidate(candidate).await?;
+                } else {
+                    // Bug 1 fix: peer connection doesn't exist yet (candidate arrived
+                    // before the offer). Buffer it for later application.
+                    let candidate: RTCIceCandidateInit = serde_json::from_str(data)?;
+                    self.pending_candidates
+                        .entry(sender_id.to_string())
+                        .or_insert_with(Vec::new)
+                        .push(candidate);
                 }
             }
             "leave_voice" => {
@@ -450,6 +526,12 @@ impl VoiceManager {
                 if let Some(pc) = peers.remove(sender_id) {
                     let _ = pc.close().await;
                 }
+                // Bug 4 fix: clean up the output stream for this peer
+                {
+                    let mut audio = self.audio_engine.lock().await;
+                    audio.remove_peer_stream(sender_id);
+                }
+                self.pending_candidates.remove(sender_id);
                 let _ = self.event_tx.send(VoiceEvent::PeerDisconnected(sender_id.to_string()));
             }
             _ => {}

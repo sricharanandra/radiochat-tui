@@ -1641,7 +1641,28 @@ async fn execute_command(app: &mut App<'_>, cmd: &str) {
             match app.current_screen {
                 CurrentScreen::InRoom => {
                     // Leave room, return to main menu
-                    // Send Leave command - state will be reset via VoiceEvent::Disconnected
+                    // Bug 2 fix: send leave_voice WS message BEFORE clearing room_id,
+                    // so it doesn't get silently dropped in the voice event handler.
+                    if app.voice.is_connected() || matches!(app.voice.status, VoiceConnectionStatus::Connecting) {
+                        if let (Some(ws_sender), Some(room_id)) = (&app.ws_sender, &app.room_id) {
+                            let payload = VoiceSignalPayload {
+                                room_id: room_id.clone(),
+                                target_user_id: None,
+                                sender_user_id: None,
+                                sender_username: None,
+                                signal_type: "leave_voice".to_string(),
+                                data: "".to_string(),
+                            };
+                            let msg = ClientMessage {
+                                message_type: "voiceSignal",
+                                payload,
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                let _ = ws_sender.send(json);
+                            }
+                        }
+                    }
+                    // Now send Leave command to voice manager for local cleanup
                     if let Some(voice_tx) = &app.voice_tx {
                         let _ = voice_tx.send(voice::manager::VoiceCommand::Leave);
                     }

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use audiopus::{coder::Decoder, coder::Encoder, Application, Channels, SampleRate};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamError;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -21,7 +21,8 @@ pub enum AudioDeviceError {
 
 pub struct AudioEngine {
     input_stream: Option<SendStream>,
-    output_streams: Vec<SendStream>,
+    /// Output streams keyed by peer_id for proper cleanup on peer disconnect
+    output_streams: HashMap<String, SendStream>,
     /// Channel to report audio errors back to VoiceManager
     error_tx: Option<mpsc::UnboundedSender<AudioDeviceError>>,
 }
@@ -72,24 +73,6 @@ impl StatefulResampler {
         }
         
         // Calculate carry-over
-        // `idx` is now the index of the "base" sample for the *next* output sample (which we couldn't produce).
-        // It is >= input.len() - 1.
-        // We want to map this to the next buffer.
-        // Next buffer starts at index 0 (which was index `len` in this frame).
-        // So new_idx = idx - len.
-        // If new_idx < 0 (e.g. -1), it means we start with `last_sample`.
-        // If new_idx >= 0, we skip `new_idx + 1` samples? No.
-        
-        // Example: len=10. Loop breaks at idx=9.
-        // new_idx = 9 - 10 = -1.
-        // Next call: starts at -1. Correct.
-        
-        // Example: len=10. Loop breaks at idx=10 (overshot by 1).
-        // new_idx = 10 - 10 = 0.
-        // Next call starts at 0.
-        // Means `s0` is `input[0]`. `s1` is `input[1]`.
-        // We effectively skipped using `last_sample` (prev[9]) as `s0`. Correct.
-        
         let new_idx = idx - (input.len() as i32);
         
         // We need to store `last_sample` regardless.
@@ -108,7 +91,7 @@ impl AudioEngine {
     pub fn new() -> Self {
         Self { 
             input_stream: None,
-            output_streams: Vec::new(),
+            output_streams: HashMap::new(),
             error_tx: None,
         }
     }
@@ -127,7 +110,24 @@ impl AudioEngine {
         self.output_streams.clear();
     }
 
-    pub fn start_playback(&mut self, mut packet_rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Result<()> {
+    /// Remove the output stream associated with a specific peer.
+    /// Called when a peer disconnects or leaves voice to prevent stream accumulation.
+    pub fn remove_peer_stream(&mut self, peer_id: &str) {
+        self.output_streams.remove(peer_id);
+    }
+
+    /// Start playback for a specific peer, replacing any existing stream for that peer.
+    pub fn start_playback_for_peer(&mut self, peer_id: &str, packet_rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Result<()> {
+        // Remove any existing stream for this peer first
+        self.output_streams.remove(peer_id);
+        
+        let stream = self.build_playback_stream(packet_rx)?;
+        self.output_streams.insert(peer_id.to_string(), SendStream(stream));
+        Ok(())
+    }
+
+    /// Build and start a cpal output stream that decodes Opus packets from packet_rx.
+    fn build_playback_stream(&self, mut packet_rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Result<cpal::Stream> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or(anyhow!("No output device"))?;
         
@@ -227,8 +227,7 @@ impl AudioEngine {
         )?;
 
         stream.play()?;
-        self.output_streams.push(SendStream(stream));
-        Ok(())
+        Ok(stream)
     }
 
     pub fn start_capture(&mut self, encoded_tx: mpsc::UnboundedSender<Vec<u8>>) -> Result<()> {
