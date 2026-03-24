@@ -309,9 +309,14 @@ impl VoiceManager {
 
         let pc = Arc::new(api.new_peer_connection(config).await?);
 
-        // Add local track
-        if let Some(track) = &self.local_track {
-            pc.add_track(Arc::clone(track) as Arc<dyn TrackLocal + Send + Sync>).await?;
+        // Add local track - must exist for a functional peer connection
+        match &self.local_track {
+            Some(track) => {
+                pc.add_track(Arc::clone(track) as Arc<dyn TrackLocal + Send + Sync>).await?;
+            }
+            None => {
+                return Err(anyhow::anyhow!("Cannot create peer connection: local track not initialized"));
+            }
         }
 
         // Handle ICE Candidates
@@ -472,10 +477,21 @@ impl VoiceManager {
     pub async fn handle_signal(&mut self, sender_id: &str, signal_type: &str, data: &str) -> Result<()> {
         match signal_type {
             "join_voice" => {
+                // Only create peer connection if we're actually in voice
+                if !self.is_joined.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
                 // Remote user joined - existing users initiate connections to the new user
-                let _ = self.create_peer_connection(sender_id.to_string(), true).await;
+                if let Err(e) = self.create_peer_connection(sender_id.to_string(), true).await {
+                    eprintln!("[VOICE ERROR] Failed to create peer connection for {}: {:?}", sender_id, e);
+                    let _ = self.event_tx.send(VoiceEvent::PeerConnectionFailed(sender_id.to_string()));
+                }
             }
             "offer" => {
+                // Only handle offer if we're in voice
+                if !self.is_joined.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
                 let pc = self.create_peer_connection(sender_id.to_string(), false).await?;
                 let desc: RTCSessionDescription = serde_json::from_str(data)?;
                 pc.set_remote_description(desc).await?;
