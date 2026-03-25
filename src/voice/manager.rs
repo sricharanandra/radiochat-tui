@@ -148,6 +148,8 @@ impl VoiceManager {
             }
         }
 
+        // Create local track BEFORE creating server connection
+        // The track must exist when create_server_connection() creates the offer
         let track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
                 mime_type: MIME_TYPE_OPUS.to_owned(),
@@ -157,6 +159,9 @@ impl VoiceManager {
             "webrtc-rs".to_owned(),
         ));
         self.local_track = Some(track.clone());
+
+        // Create server connection (adds track and creates offer)
+        self.create_server_connection().await?;
 
         let is_muted = self.is_muted.clone();
         let event_tx = self.event_tx.clone();
@@ -179,6 +184,7 @@ impl VoiceManager {
             }
         });
 
+        // Send join_voice to server
         self.event_tx.send(VoiceEvent::Signal {
             target_id: Some("server".to_string()),
             signal_type: "join_voice".to_string(),
@@ -276,6 +282,18 @@ impl VoiceManager {
             })
         }));
 
+        // Create offer and send it to server
+        let offer = pc.create_offer(None).await?;
+        pc.set_local_description(offer.clone()).await?;
+
+        if let Ok(json) = serde_json::to_string(&offer) {
+            let _ = self.event_tx.send(VoiceEvent::Signal {
+                target_id: Some("server".to_string()),
+                signal_type: "offer".to_string(),
+                data: json,
+            });
+        }
+
         self.server_peer = Some(pc.clone());
         Ok(())
     }
@@ -311,32 +329,20 @@ impl VoiceManager {
         Ok(())
     }
 
-    pub async fn handle_signal(&mut self, _sender_id: &str, signal_type: &str, data: &str) -> Result<()> {
+    pub async fn handle_signal(&mut self, sender_id: &str, signal_type: &str, data: &str) -> Result<()> {
         match signal_type {
-            "offer" => {
+            "answer" => {
                 if !self.is_joined.load(Ordering::Relaxed) {
                     return Ok(());
                 }
 
-                if self.server_peer.is_none() {
-                    self.create_server_connection().await?;
-                }
-
-                let pc = self.server_peer.as_ref().ok_or_else(|| anyhow::anyhow!("No server peer"))?;
+                let pc = match self.server_peer.as_ref() {
+                    Some(p) => p,
+                    None => return Err(anyhow::anyhow!("No server peer")),
+                };
 
                 let desc: RTCSessionDescription = serde_json::from_str(data)?;
                 pc.set_remote_description(desc).await?;
-
-                let answer = pc.create_answer(None).await?;
-                pc.set_local_description(answer.clone()).await?;
-
-                if let Ok(json) = serde_json::to_string(&answer) {
-                    self.event_tx.send(VoiceEvent::Signal {
-                        target_id: Some("server".to_string()),
-                        signal_type: "answer".to_string(),
-                        data: json,
-                    })?;
-                }
 
                 let _ = self.event_tx.send(VoiceEvent::Connected);
             }

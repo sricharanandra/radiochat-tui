@@ -473,7 +473,9 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                             payload,
                         };
                         if let Ok(json) = serde_json::to_string(&msg) {
-                            let _ = ws_sender.send(json);
+                            if let Err(e) = ws_sender.send(json) {
+                                eprintln!("[WS ERROR] Failed to send: {}", e);
+                            }
                         }
                     }
                 }
@@ -2196,7 +2198,7 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             // The VoiceManager has its own is_joined flag and will handle appropriately
             // This fixes the race condition where signals arrive before Connected event
             if let Some(voice_tx) = &app.voice_tx {
-                if let (Some(sender_id), Some(_sender_username)) = (payload.sender_user_id, payload.sender_username) {
+                if let Some(sender_id) = payload.sender_user_id {
                     let _ = voice_tx.send(voice::manager::VoiceCommand::Signal {
                         sender_id,
                         signal_type: payload.signal_type,
