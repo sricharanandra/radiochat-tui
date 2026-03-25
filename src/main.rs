@@ -129,8 +129,6 @@ struct VoiceState {
     pub tx_last_time: Option<std::time::Instant>,
     /// List of users in the voice channel (from server VoiceState messages)
     pub room_users: Vec<String>,
-    /// Connected peers (WebRTC connections established)
-    pub connected_peers: Vec<String>,
 }
 
 impl VoiceState {
@@ -138,14 +136,13 @@ impl VoiceState {
     pub fn is_connected(&self) -> bool {
         matches!(self.status, VoiceConnectionStatus::Connected)
     }
-    
+
     /// Reset all state (called on disconnect)
     pub fn reset(&mut self) {
         self.status = VoiceConnectionStatus::Disconnected;
         self.is_muted = false;
         self.is_transmitting = false;
         self.tx_last_time = None;
-        self.connected_peers.clear();
         // Note: room_users is NOT cleared here - it comes from server
     }
 }
@@ -497,17 +494,6 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                 VoiceEvent::ConnectionFailed(reason) => {
                     app.voice.reset();
                     app.status_message = format!("Voice connection failed: {}", reason);
-                }
-                VoiceEvent::PeerConnected(peer_id) => {
-                    if !app.voice.connected_peers.contains(&peer_id) {
-                        app.voice.connected_peers.push(peer_id);
-                    }
-                }
-                VoiceEvent::PeerDisconnected(peer_id) => {
-                    app.voice.connected_peers.retain(|p| p != &peer_id);
-                }
-                VoiceEvent::PeerConnectionFailed(peer_id) => {
-                    app.voice.connected_peers.retain(|p| p != &peer_id);
                 }
                 VoiceEvent::MuteStateChanged(muted) => {
                     app.voice.is_muted = muted;
